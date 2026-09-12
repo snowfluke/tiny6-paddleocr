@@ -35,11 +35,24 @@ function share(total, index, count) {
   const lo = Math.min(total, index * per);
   return [lo, Math.min(total, lo + per)];
 }
+// The GEMM's micro-kernel is eight columns wide, so a share whose width is
+// not a multiple of eight drops its remainder into the edge path, which has
+// one accumulator instead of sixteen and runs 6-8x slower per flop. Rounding
+// the share up gives 64,64,64,48 where the even split gave 60,60,60,60: more
+// work on three of the threads and no edge column anywhere but the last.
+//
+// Only the column split may round. A job sharded over channels must not, or
+// 24 channels across four threads becomes 8,8,8,0.
+function shareBy8(total, index, count) {
+  const per = (Math.ceil(total / count) + 7) & ~7;
+  const lo = Math.min(total, index * per);
+  return [lo, Math.min(total, lo + per)];
+}
 function runShare(k, c, index, count) {
   const op = c[2];
   const a = 3;
   if (op === ${JOB.gemm}) {
-    const [lo, hi] = share(c[a + 2], index, count);
+    const [lo, hi] = shareBy8(c[a + 2], index, count);
     if (lo < hi) k.gemm_range(c[a], c[a + 1], c[a + 2], c[a + 3], c[a + 4], c[a + 5], c[a + 6], c[a + 7], lo, hi);
   } else if (op === ${JOB.depthwise}) {
     const [lo, hi] = share(c[a], index, count);
