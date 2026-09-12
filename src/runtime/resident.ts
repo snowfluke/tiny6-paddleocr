@@ -13,7 +13,7 @@ import { numel, type Tensor } from "./tensor.ts";
 export type RT = { dims: number[]; ptr: number; len: number };
 
 export const BIN_OP = { add: 0, sub: 1, mul: 2, div: 3 } as const;
-export const UN_OP = { relu: 0, sigmoid: 1, erf: 2, hardSigmoid: 3 } as const;
+export const UN_OP = { relu: 0, sigmoid: 1, erf: 2, hardSigmoid: 3, gelu: 4 } as const;
 
 export class Resident {
   constructor(readonly ar: Arena) {}

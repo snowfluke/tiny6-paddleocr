@@ -8,6 +8,7 @@ import { cropForBox, recognizeBatch } from "../src/pipeline/recognize.ts";
 import { decodePng } from "../src/image/png.ts";
 import { parseOnnx } from "../src/onnx/parse.ts";
 import { Session } from "../src/runtime/graph.ts";
+import { fuseGelu } from "../src/runtime/fuse.ts";
 import { loadKernels } from "../src/wasm/backend.ts";
 import { compare, unpack } from "../tools/check.ts";
 
@@ -38,7 +39,9 @@ for (const [which, dims] of [["det", [1, 3, 256, 256]], ["rec", [1, 3, 48, 320]]
       const golden = unpack(await read(`test/golden/${which}.golden.bin`));
       const input = await read(`test/golden/${which}.input.bin`);
       const arena = backend === "wasm" ? await loadKernels(wasm) : undefined;
-      const s = new Session(g, arena);
+      // Unfused, so every intermediate the golden holds still exists to diff.
+      // The fused graph is covered by the equivalence test below.
+      const s = new Session(g, arena, { fuse: false });
 
       let checked = 0;
       const bad: string[] = [];
@@ -62,6 +65,42 @@ for (const [which, dims] of [["det", [1, 3, 256, 256]], ["rec", [1, 3, 48, 320]]
       expect(checked).toBeGreaterThan(200);
     }, 120_000);
   }
+}
+
+/**
+ * The goldens above run unfused, so this is what covers the fused graph:
+ * folding Div -> Erf -> Add -> Mul -> Mul into one Gelu must not move the
+ * output. It also pins the fusion actually firing, since a pattern matcher
+ * that silently matches nothing would otherwise pass every other test.
+ */
+for (const [which, dims, want] of [["det", [1, 3, 256, 256], 13], ["rec", [1, 3, 48, 320], 10]] as const) {
+  test(`fusing gelu leaves ${which} output unchanged`, async () => {
+    const g = parseOnnx(await read(`models/${which}.onnx`));
+    expect(fuseGelu(g).fused).toBe(want);
+
+    const n = (dims as readonly number[]).reduce((a, b) => a * b, 1);
+    const data = new Float32Array(n);
+    let seed = 7;
+    for (let i = 0; i < n; i++) {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      data[i] = (seed / 0xffffffff) * 2 - 1;
+    }
+    const feeds = { [g.inputs[0].name]: { dims: [...dims], data } };
+
+    const run = async (fuse: boolean) => {
+      const arena = await loadKernels(wasm);
+      const out = [...new Session(g, arena, { fuse }).run(feeds).values()][0];
+      arena.destroy();
+      return out;
+    };
+    const plain = await run(false);
+    const fused = await run(true);
+    let max = 0;
+    for (let i = 0; i < plain.data.length; i++) {
+      max = Math.max(max, Math.abs(plain.data[i] - fused.data[i]));
+    }
+    expect(max).toBeLessThan(2e-3);
+  }, 120_000);
 }
 
 test("PNG decoder reads both colour types", async () => {

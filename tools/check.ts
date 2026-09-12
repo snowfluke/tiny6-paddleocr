@@ -61,7 +61,7 @@ if (import.meta.main) {
   const arena = useWasm
     ? await loadKernels(new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer()))
     : undefined;
-  const s = new Session(g, arena);
+  const s = new Session(g, arena, { fuse: false });
   s.run(feeds, {
     onNode: (node, outs) => {
       for (let i = 0; i < node.output.length; i++) {

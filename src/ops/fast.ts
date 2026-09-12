@@ -110,6 +110,15 @@ export function erfFast(a: Tensor): Tensor {
   return out;
 }
 
+/** The reference for the fused Gelu: post * x * (1 + erf(x * scale)). */
+export function geluFast(a: Tensor, scale: number, post: number): Tensor {
+  const out = make(a.dims.slice());
+  const A = a.data;
+  const O = out.data;
+  for (let i = 0; i < A.length; i++) O[i] = post * A[i] * (1 + erf(A[i] * scale));
+  return out;
+}
+
 export function hardSigmoidFast(a: Tensor, alpha: number, beta: number): Tensor {
   const out = make(a.dims.slice());
   const A = a.data;

@@ -14,7 +14,8 @@ import {
 import { concat, reduceMean, resizeNearest, softmax, squeeze, transpose, unsqueeze } from "../ops/shape.ts";
 import { convResident, convTranspose2x2Resident, matmulResident } from "../ops/conv-wasm.ts";
 import { BIN_OP, lastUseMap, Resident, UN_OP, type RT } from "./resident.ts";
-import { binaryFast, erfFast, hardSigmoidFast, maxPool2x2Same, reduceMeanTrailing, reluFast, resizeNearestFast, sigmoidFast } from "../ops/fast.ts";
+import { fuseGelu } from "./fuse.ts";
+import { binaryFast, erfFast, geluFast, hardSigmoidFast, maxPool2x2Same, reduceMeanTrailing, reluFast, resizeNearestFast, sigmoidFast } from "../ops/fast.ts";
 import type { Arena } from "../wasm/backend.ts";
 
 function toTensor(t: OnnxTensor): Tensor {
@@ -119,6 +120,11 @@ function axesOf(n: OnnxNode, x: (Tensor | null)[]): number[] {
   return x[1] ? [...x[1].data] : [];
 }
 
+export type SessionOptions = {
+  /** Default true. False runs the graph node for node as exported. */
+  fuse?: boolean;
+};
+
 export type RunOptions = {
   /** Called after every node, for golden-diffing. */
   onNode?: (node: OnnxNode, outputs: Tensor[]) => void;
@@ -138,8 +144,16 @@ export class Session {
   /** Reused across nodes so the input list is not reallocated 219 times. */
   private readonly scratchInputs: (RT | null)[] = [];
 
-  /** Without an arena every op runs in TypeScript, which is the reference path. */
-  constructor(readonly graph: OnnxGraph, arena?: Arena) {
+  readonly graph: OnnxGraph;
+
+  /**
+   * Without an arena every op runs in TypeScript, which is the reference path.
+   * Pass `fuse: false` to execute the graph exactly as exported, which is what
+   * the golden check does so it still sees every intermediate tensor.
+   */
+  constructor(graph: OnnxGraph, arena?: Arena, opts: SessionOptions = {}) {
+    graph = opts.fuse === false ? graph : fuseGelu(graph).graph;
+    this.graph = graph;
     for (const [name, t] of graph.initializers) this.consts.set(name, toTensor(t));
     this.lastUse = lastUseMap(graph.nodes, graph.outputs.map((o) => o.name));
     graph.nodes.forEach((n, i) => {
@@ -279,6 +293,8 @@ export class Session {
         return [r.unary(UN_OP.erf, a)];
       case "HardSigmoid":
         return [r.unary(UN_OP.hardSigmoid, a, n.attrs.get("alpha")?.f ?? 0.2, n.attrs.get("beta")?.f ?? 0.5)];
+      case "Gelu":
+        return [r.unary(UN_OP.gelu, a, n.attrs.get("scale")!.f!, n.attrs.get("post")!.f!)];
       case "Identity":
         return [a];
       case "Squeeze": {
@@ -352,6 +368,8 @@ export class Session {
         return [erfFast(a)];
       case "HardSigmoid":
         return [hardSigmoidFast(a, n.attrs.get("alpha")?.f ?? 0.2, n.attrs.get("beta")?.f ?? 0.5)];
+      case "Gelu":
+        return [geluFast(a, n.attrs.get("scale")!.f!, n.attrs.get("post")!.f!)];
       case "Identity":
         return [a];
       case "MaxPool": {

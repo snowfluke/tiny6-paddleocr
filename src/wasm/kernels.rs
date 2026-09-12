@@ -491,9 +491,14 @@ pub unsafe extern "C" fn unary(op: u32, n: usize, a: *const f32, out: *mut f32, 
             0 => f32x4_max(x, zero),
             1 => f32x4_div(one, f32x4_add(one, expf4(f32x4_neg(x)))),
             2 => erff4(x),
-            _ => f32x4_min(
+            3 => f32x4_min(
                 one,
                 f32x4_max(zero, fma(f32x4_splat(p0), x, f32x4_splat(p1))),
+            ),
+            // gelu, folded from Div -> Erf -> Add -> Mul -> Mul. One pass.
+            _ => f32x4_mul(
+                f32x4_mul(x, f32x4_splat(p1)),
+                f32x4_add(one, erff4(f32x4_mul(x, f32x4_splat(p0)))),
             ),
         };
         v128_store(out.add(i) as *mut v128, r);
@@ -505,10 +510,11 @@ pub unsafe extern "C" fn unary(op: u32, n: usize, a: *const f32, out: *mut f32, 
             0 => if x > 0.0 { x } else { 0.0 },
             1 => 1.0 / (1.0 + expf(-x)),
             2 => erff(x),
-            _ => {
+            3 => {
                 let v = p0 * x + p1;
                 if v < 0.0 { 0.0 } else if v > 1.0 { 1.0 } else { v }
             }
+            _ => x * p1 * (1.0 + erff(x * p0)),
         };
         i += 1;
     }
