@@ -230,7 +230,6 @@ pub unsafe extern "C" fn depthwise(
                 (3, 3, 1) => dw_rows::<3, 3, 1>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
                 (3, 3, 2) => dw_rows::<3, 3, 2>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
                 (5, 5, 1) => dw_rows::<5, 5, 1>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
-                (5, 5, 2) => dw_rows::<5, 5, 2>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
                 _ => false,
             };
             if done {
@@ -299,7 +298,8 @@ unsafe fn even_lanes(v0: v128, v1: v128, v2: v128, kx: usize) -> v128 {
 }
 
 /// One channel of a depthwise convolution at a compile-time kernel size and
-/// stride. The taps sit in registers for the whole channel; the old loop
+/// stride. Only the shapes the models use are instantiated; 5x5 stride 2
+/// does not occur, so there is no arm for it. The taps sit in registers for the whole channel; the old loop
 /// re-splatted each one per four outputs, and had no vector path at all for
 /// stride 2, which ran every element through dw_scalar with bounds checks
 /// per tap. Measured before this: 103 MB moved in 16.4 ms at four threads,
@@ -342,8 +342,10 @@ unsafe fn dw_rows<const KH: usize, const KW: usize, const SX: usize>(
         // step: a single chain of KH*KW fused multiply-adds is latency bound,
         // the same limit the GEMM hit before it went to sixteen accumulators.
         while ox + 8 <= ow && ox + 4 <= vec_hi {
-            let mut a0 = [bias; KH];
-            let mut a1 = [bias; KH];
+            let mut a0 = [f32x4_splat(0.0); KH];
+            let mut a1 = [f32x4_splat(0.0); KH];
+            a0[0] = bias;
+            a1[0] = bias;
             for ky in 0..KH {
                 let iy = iy0 + ky as isize;
                 if iy < 0 || iy >= ih as isize {
@@ -375,14 +377,13 @@ unsafe fn dw_rows<const KH: usize, const KW: usize, const SX: usize>(
                 s0 = f32x4_add(s0, a0[ky]);
                 s1 = f32x4_add(s1, a1[ky]);
             }
-            // The bias was seeded into every chain; take the extra copies out.
-            let extra = f32x4_mul(bias, f32x4_splat((KH - 1) as f32));
-            v128_store(orow.add(ox) as *mut v128, apply(f32x4_sub(s0, extra), act));
-            v128_store(orow.add(ox + 4) as *mut v128, apply(f32x4_sub(s1, extra), act));
+            v128_store(orow.add(ox) as *mut v128, apply(s0, act));
+            v128_store(orow.add(ox + 4) as *mut v128, apply(s1, act));
             ox += 8;
         }
         while ox + 4 <= ow && ox <= vec_hi {
-            let mut a0 = [bias; KH];
+            let mut a0 = [f32x4_splat(0.0); KH];
+            a0[0] = bias;
             for ky in 0..KH {
                 let iy = iy0 + ky as isize;
                 if iy < 0 || iy >= ih as isize {
@@ -406,8 +407,7 @@ unsafe fn dw_rows<const KH: usize, const KW: usize, const SX: usize>(
             for ky in 1..KH {
                 s0 = f32x4_add(s0, a0[ky]);
             }
-            let extra = f32x4_mul(bias, f32x4_splat((KH - 1) as f32));
-            v128_store(orow.add(ox) as *mut v128, apply(f32x4_sub(s0, extra), act));
+            v128_store(orow.add(ox) as *mut v128, apply(s0, act));
             ox += 4;
         }
         while ox < ow {
