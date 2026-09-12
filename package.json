@@ -1,0 +1,34 @@
+{
+  "name": "tiny6-paddleocr",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "No onnxruntime. PP-OCRv6 tiny with zero runtime dependencies using WASM SIMD kernels. Just a few KB!",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/node.ts",
+    "./web": "./src/browser.ts",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "models",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun tools/build-wasm.ts && bun tools/build-web.ts",
+    "test": "bun test",
+    "check": "bun tools/check.ts det --wasm && bun tools/check.ts rec --wasm",
+    "typecheck": "bunx tsc --noEmit",
+    "bench": "bun bench/run.ts",
+    "bench:gemm": "bun tools/gemm-bench.ts",
+    "ocr": "bun tools/ocr.ts",
+    "demo": "bun tools/serve.ts",
+    "golden": "bun tools/expose.ts models/det.onnx test/golden/det.exposed.onnx && bun tools/expose.ts models/rec.onnx test/golden/rec.exposed.onnx && bun tools/golden.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "onnxruntime-node": "^1.29.0",
+    "typescript": "^5.7.0"
+  }
+}
