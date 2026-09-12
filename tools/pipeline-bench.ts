@@ -6,13 +6,13 @@
 //
 //   bun tools/pipeline-bench.ts [image] [recWorkers] [runs]
 
-import { Ocr } from "../src/ocr.ts";
+import { defaultRecWorkers, Ocr } from "../src/ocr.ts";
 import { makeRecWorker } from "../src/node.ts";
 import { decodeImage } from "../src/image/jpeg.ts";
 
 const [imageArg, workersArg, runsArg] = process.argv.slice(2);
 const image = imageArg ?? "test/images/receipt.jpg";
-const recWorkers = Number(workersArg ?? 4);
+const recWorkers = workersArg ? Number(workersArg) : defaultRecWorkers();
 const runs = Number(runsArg ?? 6);
 const read = async (p: string) => new Uint8Array(await Bun.file(p).arrayBuffer());
 
