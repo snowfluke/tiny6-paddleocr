@@ -34,13 +34,13 @@ onnxruntime-node is native ARM64 and does not.
 
 | model | input | ours 1t | ours 4t | ort-web 1t | ort-web 4t | ort native |
 |---|---|---|---|---|---|---|
-| det | 1x3x960x960 | 272 ms | **96 ms** | 246 ms | 76 ms | 55 ms |
-| rec | 1x3x48x320 | 13.3 ms | **7.2 ms** | 11.8 ms | 3.6 ms | 3 ms |
+| det | 1x3x960x960 | 272 ms | **95 ms** | 246 ms | 77 ms | 55 ms |
+| rec | 1x3x48x320 | 13.3 ms | **6.6 ms** | 11.8 ms | 3.6 ms | 3 ms |
 
-Against onnxruntime-web the gap is 1.1x on one thread and 1.3x on four for
-detection. ort-web scales 3.3x on four threads where we get 2.8x; the
-difference is not the split (see Threads), it is that every thread here slows
-by about a quarter once all cores are loaded, and ort-web's kernels move fewer
+Against onnxruntime-web the gap is 1.1x on one thread and 1.2x on four for
+detection. ort-web scales 3.2x on four threads where we get 2.9x; what is
+left is not the split (see Threads), it is that every thread here slows by
+about a quarter once all cores are loaded, and ort-web's kernels move fewer
 bytes per flop.
 
 End to end on a 720x1280 receipt, both warm, minimum of six, measured in the
@@ -82,7 +82,8 @@ Detection at 960x960, as the work landed:
 | worker pool | 214 |
 | 8x8 GEMM micro-kernel | 144 |
 | gelu fused, concat and transposed conv kept in wasm | 118 |
-| im2col in strips, one job per strip, depthwise specialised | **96** |
+| im2col in strips, one job per strip, depthwise specialised | 96 |
+| residual add in the gemm epilogue, work claimed in blocks | **95** (loaded machine) |
 
 Recognition on the receipt, 28 crops, wall:
 
@@ -104,8 +105,10 @@ Checked against `ppu-paddle-ocr` (onnxruntime + OpenCV) on the same file.
 
 - Every intermediate tensor of both models matches ORT to 2e-3, on the
   TypeScript path and the WASM path. 242 tensors for detection, 219 for
-  recognition. Worker threads produce bit-identical output to one thread, and
-  the recognition pool returns exactly what the serial path does.
+  recognition. Every node of a threaded run is bit-identical to the
+  single-threaded one, checked over six runs because a race only shows on
+  some schedules, and the recognition pool returns exactly what the serial
+  path does.
 - Receipt: 13 of 18 lines byte-identical with filtering off. Two of the five
   that differ are barcode noise both implementations read as garbage; three
   differ by one character because the crops differ by a pixel or two.
@@ -200,8 +203,12 @@ nothing measurable on recognition, because a recognition tensor fits in cache
 and the extra passes over it were nearly free.
 
 `src/wasm/pool.ts` splits a single kernel across threads over one shared
-linear memory: each share writes a disjoint slice, so a job is one sequence
-bump plus a barrier, no locks. That suits detection.
+linear memory. A job's range is cut into four blocks per thread and every
+thread, the main one included, claims the next block with one atomic add;
+each block writes a disjoint slice, so a job is one sequence bump, a claim
+counter and a barrier, no locks. Static equal shares came first and measured
+1.12x slower: the barrier waited on whichever thread finished last, and with
+four threads one always did. That suits detection.
 
 A recognition crop is too small for a split to pay while the graph still
 dispatches 146 jobs, so `src/pipeline/rec-pool.ts` gives each worker a
@@ -308,6 +315,15 @@ pixels:
 
 It also caught the worker pool's startup race, where a worker read the job
 sequence number after reporting ready and so slept through the first job.
+
+The tensor-level threading test caught a second race that the text-level one
+had passed for a week: every worker instantiates the same module on the same
+shared memory, and a module's `__stack_pointer` starts at the same address in
+every instance, so all workers ran their shadow stacks on the same bytes. No
+kernel spilled a local until the specialised 5x5 depthwise kernel put 25 taps
+in play; after that, threaded detection differed from single-threaded on
+about one run in three, by a few activations in one layer, and the text was
+usually still right. Each worker now gets its own stack region from the arena.
 
 ## Measured and rejected
 
