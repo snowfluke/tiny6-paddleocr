@@ -67,6 +67,45 @@ pub unsafe extern "C" fn gemm(
 /// accumulators, 25.4 with eight, 35.9 with sixteen, on the same shape.
 /// (Packing B into a contiguous panel was tried and measured 0.99-1.05x, so
 /// locality is not the constraint here; the dependency chains are.)
+/// One 8 row by 8 column tile of the product, held in 16 accumulators. The
+/// accumulator count is what the kernel is limited by: 4 gives 19.6 GFLOP/s,
+/// 8 gives 25.4, 16 gives 35.9.
+#[inline(always)]
+unsafe fn tile8x8(
+    mi: usize,
+    j: usize,
+    k: usize,
+    n: usize,
+    a: *const f32,
+    b: *const f32,
+    c: *mut f32,
+    bias: *const f32,
+    act: u32,
+) {
+    let mut acc_lo = [f32x4_splat(0.0); 8];
+    let mut acc_hi = [f32x4_splat(0.0); 8];
+    for r in 0..8 {
+        let v = if bias.is_null() { 0.0 } else { *bias.add(mi + r) };
+        acc_lo[r] = f32x4_splat(v);
+        acc_hi[r] = f32x4_splat(v);
+    }
+    for kk in 0..k {
+        let brow = b.add(kk * n + j);
+        let b0 = v128_load(brow as *const v128);
+        let b1 = v128_load(brow.add(4) as *const v128);
+        for r in 0..8 {
+            let av = f32x4_splat(*a.add((mi + r) * k + kk));
+            acc_lo[r] = fma(av, b0, acc_lo[r]);
+            acc_hi[r] = fma(av, b1, acc_hi[r]);
+        }
+    }
+    for r in 0..8 {
+        let cr = c.add((mi + r) * n + j);
+        v128_store(cr as *mut v128, apply(acc_lo[r], act));
+        v128_store(cr.add(4) as *mut v128, apply(acc_hi[r], act));
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn gemm_range(
     m: usize,
@@ -86,32 +125,15 @@ pub unsafe extern "C" fn gemm_range(
     let m8 = m & !7;
     let j_end = lo + ((hi - lo) & !7);
 
+    // `mi` stays outside and `j` inside. Swapping them so the outer loop
+    // re-reads the smaller operand looks right on paper and measured 0.5x:
+    // with `j` outside, each tile writes 8 rows of C that are n*4 bytes apart
+    // and moves on before any cache line is full.
     let mut mi = 0;
     while mi < m8 {
-        let mut acc_lo = [f32x4_splat(0.0); 8];
-        let mut acc_hi = [f32x4_splat(0.0); 8];
         let mut j = lo;
         while j < j_end {
-            for r in 0..8 {
-                let v = if bias.is_null() { 0.0 } else { *bias.add(mi + r) };
-                acc_lo[r] = f32x4_splat(v);
-                acc_hi[r] = f32x4_splat(v);
-            }
-            for kk in 0..k {
-                let brow = b.add(kk * n + j);
-                let b0 = v128_load(brow as *const v128);
-                let b1 = v128_load(brow.add(4) as *const v128);
-                for r in 0..8 {
-                    let av = f32x4_splat(*a.add((mi + r) * k + kk));
-                    acc_lo[r] = fma(av, b0, acc_lo[r]);
-                    acc_hi[r] = fma(av, b1, acc_hi[r]);
-                }
-            }
-            for r in 0..8 {
-                let cr = c.add((mi + r) * n + j);
-                v128_store(cr as *mut v128, apply(acc_lo[r], act));
-                v128_store(cr.add(4) as *mut v128, apply(acc_hi[r], act));
-            }
+            tile8x8(mi, j, k, n, a, b, c, bias, act);
             j += 8;
         }
         mi += 8;
