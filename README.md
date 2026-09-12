@@ -27,12 +27,17 @@ engines hold cores and whichever ran second would look slow.
 
 | model | input | 1 thread | 4 threads | ORT | vs ORT |
 |---|---|---|---|---|---|
-| det | 1x3x960x960 | 336 ms | **144 ms** | 55 ms | 2.6x |
-| det | 1x3x256x256 | 27 ms | **16 ms** | 4 ms | 4.4x |
-| rec | 1x3x48x320 | 20 ms | **16 ms** | 3 ms | 5.5x |
+| det | 1x3x960x960 | 302 ms | **121 ms** | 55 ms | 2.2x |
+| det | 1x3x256x256 | 25 ms | **12 ms** | 4 ms | 3.1x |
+| rec | 1x3x48x320 | 20 ms | **14 ms** | 3 ms | 4.7x |
 
-End to end on a 720x1280 receipt: detection ~160 ms, recognition ~250 ms for
-28 crops across four workers, **~400 ms total**.
+End to end on a 720x1280 receipt: detection ~140 ms, recognition ~245 ms for
+28 crops across four workers, **~385 ms total**.
+
+Four threads is the default because this machine has four performance cores.
+Measured at 960x960: 2 threads 180 ms, 4 threads 121 ms, 5 threads 140 ms,
+6 threads 131 ms, 8 threads 129 ms. Every job ends at a barrier, so a share
+that lands on an efficiency core holds up the other three.
 
 Detection at 960x960, as the work landed:
 
@@ -42,7 +47,8 @@ Detection at 960x960, as the work landed:
 | convolutions in WASM | 1170 |
 | activations resident in WASM memory | 445 |
 | worker pool | 214 |
-| 8x8 GEMM micro-kernel | **144** |
+| 8x8 GEMM micro-kernel | 144 |
+| gelu fused, concat and transposed conv kept in wasm | **121** |
 
 ## Accuracy
 
@@ -117,6 +123,11 @@ Detection and recognition need opposite shapes, which the measurements forced:
 | data-parallel speedup | 2.3x | **1.07x** |
 | what runs in parallel | one kernel, split | one whole crop per worker |
 
+The same size difference decides which optimisations pay at all. Folding the
+five-node gelu into one kernel is worth 1.12x on detection at 960x960 and
+nothing measurable on recognition, because a recognition tensor fits in cache
+and the extra passes over it were nearly free.
+
 `src/wasm/pool.ts` splits a single kernel across threads over one shared
 linear memory: each share writes a disjoint slice, so a job is one sequence
 bump plus a barrier, no locks. That suits detection.
@@ -139,7 +150,23 @@ kernel is limited by, measured on a 1x1 convolution at 240x240:
 
 Packing B into a contiguous panel was tried first and measured 0.99-1.05x, so
 locality was not the constraint; the dependency chains were. The production
-kernel reaches 33-40 GFLOP/s against ORT's 79.6 single-threaded.
+kernel reaches 33-36 GFLOP/s.
+
+### The engine is the ceiling
+
+ORT's 79.6 GFLOP/s single-threaded is not reachable from WebAssembly on this
+machine, and the gap is not the kernel.
+
+Sixteen independent accumulator chains with no memory traffic at all, which is
+the most favourable shape a FLOP benchmark can have, measure **48.5 GFLOP/s**
+under Bun. The identical loop written with `f32x4.relaxed_madd` measures 48.5
+as well, so neither JavaScriptCore nor V8 is emitting a fused multiply-add
+here; V8 runs the same module at 21 GFLOP/s.
+
+So the kernel at 33-36 GFLOP/s already reaches about 70% of what the engine
+can issue, and perfect tuning would land near 48.5, still below native. Effort
+is better spent on what the engine does not cap: fewer passes over memory, and
+threads.
 
 ### Threads
 
@@ -197,13 +224,19 @@ sequence number after reporting ready and so slept through the first job.
   locality costs more than the per-run overhead it saves. `recognizeBatch` is
   kept, correct and tested, but is not the default.
 - **Packing the GEMM's B operand.** 0.99-1.05x. Removed.
+- **Relaxed SIMD.** `f32x4.relaxed_madd` is in the kernels and is worth 15% on
+  3x3 im2col, but no engine tested actually fuses it. See above.
+- **`v128.load32_splat` for the GEMM's A operand.** One instruction instead of
+  a scalar load plus a splat, and 0.90x measured. JavaScriptCore lowers it
+  worse than the pair.
 - **More than four threads.** Slower on big.LITTLE. See above.
 
 ## Not done
 
-- **A better GEMM still.** 33-40 GFLOP/s against ORT's 79.6 single-threaded is
-  most of the remaining gap. Real packing with a proper MR x NR blocking and
-  cache-tiled loops is the next step.
+- **A better GEMM still.** 33-36 GFLOP/s against the engine's 48.5 ceiling.
+  Worth about 1.35x on the convolutions if it were perfect, and convolutions
+  are 58% of threaded detection, so call it 1.2x end to end. Cache-tiled loops
+  with proper MR x NR blocking are the next step.
 - **The recognition pool in the browser.** The demo gets detection threads but
   runs recognition serially: `src/browser.ts` has no `makeRecWorker`, which
   needs `rec-worker.ts` bundled into a second inlined blob. Node and Bun get
