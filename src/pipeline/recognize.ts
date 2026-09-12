@@ -116,16 +116,29 @@ export function ctcGreedyDecode(
 }
 
 /** The model reads the red channel replicated across three planes. */
-function cropToTensor(img: RGBA): { data: Float32Array; width: number } {
+/**
+ * Crop widths are padded up to this. An odd width makes every downstream
+ * convolution's column count ragged, and the GEMM's ragged tail is scalar:
+ * measured 16 -> 17 px at 2.0 -> 2.9 ms, 64 -> 65 at 2.9 -> 4.1. Wider alignment
+ * measured no faster end to end, because the wall is set by the widest crops
+ * and those lose only 8% to raggedness. The padding
+ * is zero in normalised space, mid-grey, which is what PaddleOCR trains with.
+ */
+export const REC_WIDTH_ALIGN = 8;
+
+export function cropToTensor(img: RGBA): { data: Float32Array; width: number } {
   const aspect = img.width / img.height;
   const w = Math.max(MIN_CROP_WIDTH, Math.round(REC_HEIGHT * aspect));
+  const wp = Math.ceil(w / REC_WIDTH_ALIGN) * REC_WIDTH_ALIGN;
   const r = resize(img, w, REC_HEIGHT);
-  const n = w * REC_HEIGHT;
+  const n = wp * REC_HEIGHT;
   const t = new Float32Array(3 * n);
-  for (let i = 0, p = 0; i < n; i++, p += 4) t[i] = r.data[p] / 127.5 - 1;
+  for (let y = 0; y < REC_HEIGHT; y++) {
+    for (let x = 0, p = y * w * 4, o = y * wp; x < w; x++, p += 4, o++) t[o] = r.data[p] / 127.5 - 1;
+  }
   t.copyWithin(n, 0, n);
   t.copyWithin(2 * n, 0, n);
-  return { data: t, width: w };
+  return { data: t, width: wp };
 }
 
 /**

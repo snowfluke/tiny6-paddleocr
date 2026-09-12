@@ -13,7 +13,7 @@ import type { RGBA } from "../image/png.ts";
 
 export type RecInit = { kind: "init"; rec: Uint8Array; wasm: Uint8Array; dict: string };
 export type RecTask = { kind: "task"; id: number; width: number; height: number; data: Uint8Array };
-export type RecDone = { id: number; text: string; confidence: number };
+export type RecDone = { id: number; text: string; confidence: number; ms: number };
 
 let session: Session | null = null;
 let dict: string[] = [];
@@ -30,6 +30,8 @@ self.onmessage = async (e: MessageEvent<RecInit | RecTask>) => {
     return;
   }
   const img: RGBA = { width: msg.width, height: msg.height, data: msg.data };
+  const t = performance.now();
   const { text, confidence } = recognizeCrop(session!, img, dict);
-  postMessage({ id: msg.id, text, confidence } satisfies RecDone);
+  // The time inside the worker, so a caller can tell compute from queueing.
+  postMessage({ id: msg.id, text, confidence, ms: performance.now() - t } satisfies RecDone);
 };

@@ -152,9 +152,12 @@ export class Ocr {
     const { minConfidence = DEFAULT_MIN_CONFIDENCE, dropSeparators = true } = filter;
 
     const rows = readingOrder(boxes);
-    const flat = rows.flat();
-    // Cropping stays here: it is cheap next to the graph, and the pixels have
-    // to cross to the worker either way.
+    // Widest first. Each idle worker takes the next crop, so a wide one that
+    // starts late runs alone at the end while the other workers sit idle; a
+    // 424 px crop costs 25 ms against 5 for a narrow one. Cropping stays
+    // here: it is cheap next to the graph, and the pixels cross to the worker
+    // either way.
+    const flat = rows.flat().sort((a, b) => b.width / b.height - a.width / a.height);
     const decoded = await this.recPool.run(flat.map((b) => cropForBox(img, b)));
 
     const byBox = new Map(flat.map((b, i) => [b, decoded[i]]));
