@@ -8,16 +8,34 @@
 //
 //   bun tools/ab.ts <rev> <model.onnx> <dims> <threads> [runs] [rounds]
 //   bun tools/ab.ts HEAD models/det.onnx 1x3x960x960 4
+//
+// Or any script that prints one number on its last stdout line:
+//   bun tools/ab.ts <rev> --script tools/pipeline-bench.ts [args...] [-- rounds]
 
 import { mkdirSync, rmSync } from "node:fs";
 
-const [rev, model, dims, threadsArg, runsArg, roundsArg] = process.argv.slice(2);
-if (!rev || !model || !dims || !threadsArg) {
-  console.error("usage: bun tools/ab.ts <rev> <model.onnx> <dims> <threads> [runs] [rounds]");
-  process.exit(2);
+const argv = process.argv.slice(2);
+const rev = argv[0];
+const scriptMode = argv[1] === "--script";
+let rounds = 4;
+let command: string[];
+let label: string;
+if (scriptMode) {
+  const sep = argv.indexOf("--");
+  const scriptArgs = argv.slice(2, sep < 0 ? undefined : sep);
+  if (sep >= 0) rounds = Number(argv[sep + 1]);
+  command = ["bun", ...scriptArgs];
+  label = scriptArgs.join(" ");
+} else {
+  const [, model, dims, threadsArg, runsArg, roundsArg] = argv;
+  if (!rev || !model || !dims || !threadsArg) {
+    console.error("usage: bun tools/ab.ts <rev> <model.onnx> <dims> <threads> [runs] [rounds]");
+    process.exit(2);
+  }
+  rounds = Number(roundsArg ?? 4);
+  command = ["bun", "tools/thread-one.ts", model, dims, threadsArg, runsArg ?? "3"];
+  label = `${model} ${dims} ${threadsArg}t`;
 }
-const runs = runsArg ?? "3";
-const rounds = Number(roundsArg ?? 4);
 
 const base = `/tmp/tiny6-ab-${rev.replace(/[^\w.-]/g, "_")}`;
 rmSync(base, { recursive: true, force: true });
@@ -33,7 +51,7 @@ if (Bun.spawnSync(["bun", "tools/build-wasm.ts"], { cwd: base }).exitCode !== 0)
 }
 
 const time = (cwd: string): number => {
-  const p = Bun.spawnSync(["bun", "tools/thread-one.ts", model, dims, threadsArg, runs], { cwd });
+  const p = Bun.spawnSync(command, { cwd });
   const out = new TextDecoder().decode(p.stdout).trim().split("\n").pop() ?? "";
   const v = Number(out);
   if (!Number.isFinite(v)) throw new Error(`bad timing from ${cwd}: ${out}`);
@@ -54,6 +72,4 @@ for (let i = 0; i < rounds; i++) {
   console.log(`  round ${i + 1}  ${rev} ${o.toFixed(1)}  working tree ${n.toFixed(1)}`);
 }
 const ratio = bestOld / bestNew;
-console.log(
-  `${model} ${dims} ${threadsArg}t: ${rev} ${bestOld.toFixed(1)} ms -> ${bestNew.toFixed(1)} ms  ${ratio.toFixed(2)}x`,
-);
+console.log(`${label}: ${rev} ${bestOld.toFixed(1)} ms -> ${bestNew.toFixed(1)} ms  ${ratio.toFixed(2)}x`);

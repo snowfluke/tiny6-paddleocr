@@ -25,7 +25,8 @@
     "ocr": "bun tools/ocr.ts",
     "demo": "bun tools/serve.ts",
     "golden": "bun tools/expose.ts models/det.onnx test/golden/det.exposed.onnx && bun tools/expose.ts models/rec.onnx test/golden/rec.exposed.onnx && bun tools/golden.ts",
-    "ab": "bun tools/ab.ts"
+    "ab": "bun tools/ab.ts",
+    "bench:pipeline": "bun tools/pipeline-bench.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",
@@ -33,4 +34,4 @@
     "onnxruntime-web": "^1.29.0",
     "typescript": "^5.7.0"
   }
-}
+}\n
