@@ -64,9 +64,11 @@ export function convResident(
     } else {
       for (let p0 = 0; p0 < plane; p0 += strip) {
         const width = Math.min(strip, plane - p0);
-        r.ar.pIm2colStrip([Cin, H, W, OW, kh, kw, sy, sx, pt, pl, dy, dx, p0, width, xi, col!.ptr]);
         // B is this strip, `width` wide; C is the full output row, `plane` wide.
-        r.ar.pGemm(Cout, K, width, w.ptr, col!.ptr, yi + p0 * 4, bPtr, act, width, plane);
+        r.ar.pConvStrip([
+          Cin, H, W, OW, kh, kw, sy, sx, pt, pl, dy, dx, p0, width, xi, col!.ptr,
+          Cout, K, w.ptr, yi + p0 * 4, bPtr, act, plane,
+        ]);
       }
     }
   }

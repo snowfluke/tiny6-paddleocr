@@ -9,8 +9,18 @@ export type Kernels = {
   memory?: WebAssembly.Memory;
   heap_base(): number;
   gemm_range(
-    m: number, k: number, n: number, a: number, b: number, c: number,
-    bias: number, act: number, lo: number, hi: number,
+    m: number,
+    k: number,
+    n: number,
+    ldb: number,
+    ldc: number,
+    a: number,
+    b: number,
+    c: number,
+    bias: number,
+    act: number,
+    lo: number,
+    hi: number,
   ): void;
   binary(
     op: number, mode: number, n: number, inner: number, channels: number,
@@ -175,10 +185,15 @@ export class Arena {
     }
   }
 
-  pIm2colStrip(args: number[]) {
-    const cin = args[0];
-    if (this.pool && cin * args[13] >= PARALLEL_MIN) this.pool.dispatch(JOB.im2colStrip, args);
-    else (this.k.im2col_strip as (...a: number[]) => void)(...args.slice(1), 0, cin);
+  /** im2col and GEMM for one strip as a single job; see JOB.convStrip. */
+  pConvStrip(args: number[]) {
+    const [cin, ih, iw, ow, kh, kw, sy, sx, pt, pl, dy, dx, p0, width, x, col, m, k, w, cbase, bias, act, ldc] = args;
+    if (this.pool && m * width >= PARALLEL_MIN) {
+      this.pool.dispatch(JOB.convStrip, args);
+    } else {
+      this.k.im2col_strip(ih, iw, ow, kh, kw, sy, sx, pt, pl, dy, dx, p0, width, x, col, 0, cin);
+      this.k.gemm_range(m, k, width, width, ldc, w, col, cbase, bias, act, 0, width);
+    }
   }
 
   pDepthwise(args: number[]) {

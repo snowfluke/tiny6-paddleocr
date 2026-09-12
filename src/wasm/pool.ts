@@ -14,7 +14,7 @@ export const JOB = {
   scatter2x2: 6,
   softmax: 7,
   affine: 8,
-  im2colStrip: 9,
+  convStrip: 10,
 } as const;
 
 /** Int32 slots in the control block: 0 sequence, 1 completions, 2 op, 3+ args. */
@@ -57,10 +57,21 @@ function runShare(k, c, index, count) {
   } else if (op === ${JOB.depthwise}) {
     const [lo, hi] = share(c[a], index, count);
     if (lo < hi) k.depthwise(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], lo, hi);
-  } else if (op === ${JOB.im2colStrip}) {
-    const [lo, hi] = share(c[a], index, count);
-    if (lo < hi) k.im2col_strip(c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], lo, hi);
-    } else if (op === ${JOB.unary}) {
+  } else if (op === ${JOB.convStrip}) {
+    // One strip of a dense convolution, im2col and GEMM together. Each share
+    // builds the columns it will multiply into its own region of the column
+    // buffer, so there is no barrier between the two and no share waits on
+    // another's im2col. Args: cin ih iw ow kh kw sy sx pt pl dy dx p0 width x
+    // col m k w cbase bias act ldc.
+    const width = c[a + 13];
+    const [lo, hi] = shareBy8(width, index, count);
+    if (lo < hi) {
+      const k_ = c[a + 17];
+      const colw = c[a + 15] + lo * k_ * 4;
+      k.im2col_strip(c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12] + lo, hi - lo, c[a+14], colw, 0, c[a]);
+      k.gemm_range(c[a+16], k_, hi - lo, hi - lo, c[a+22], c[a+18], colw, c[a+19] + lo * 4, c[a+20], c[a+21], 0, hi - lo);
+    }
+      } else if (op === ${JOB.unary}) {
     const [lo, hi] = share(c[a + 1], index, count);
     if (lo < hi) k.unary(c[a], hi - lo, c[a + 2] + lo * 4, c[a + 3] + lo * 4, f[a + 4], f[a + 5]);
   } else if (op === ${JOB.binary}) {

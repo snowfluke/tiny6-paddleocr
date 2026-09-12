@@ -29,10 +29,10 @@ for (const [label, M, K, N] of cases) {
 
   const flops = 2 * M * K * N;
   const time = (_a: number, _b: number) => {
-    k.gemm_range(M, K, N, A, B, C, 0, 0, 0, N);
+    k.gemm_range(M, K, N, N, N, A, B, C, 0, 0, 0, N);
     const t = performance.now();
     const R = 5;
-    for (let i = 0; i < R; i++) k.gemm_range(M, K, N, A, B, C, 0, 0, 0, N);
+    for (let i = 0; i < R; i++) k.gemm_range(M, K, N, N, N, A, B, C, 0, 0, 0, N);
     return (performance.now() - t) / R;
   };
   const ms = time(0, 0);
