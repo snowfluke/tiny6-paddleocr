@@ -14,7 +14,7 @@ import {
 import { concat, reduceMean, resizeNearest, softmax, squeeze, transpose, unsqueeze } from "../ops/shape.ts";
 import { convResident, convTranspose2x2Resident, matmulResident } from "../ops/conv-wasm.ts";
 import { BIN_OP, lastUseMap, Resident, UN_OP, type RT } from "./resident.ts";
-import { fuseGelu } from "./fuse.ts";
+import { ACT_RELU, fuseConvEpilogue, fuseGelu } from "./fuse.ts";
 import { binaryFast, erfFast, geluFast, hardSigmoidFast, maxPool2x2Same, reduceMeanTrailing, reluFast, resizeNearestFast, sigmoidFast } from "../ops/fast.ts";
 import type { Arena } from "../wasm/backend.ts";
 
@@ -152,7 +152,7 @@ export class Session {
    * the golden check does so it still sees every intermediate tensor.
    */
   constructor(graph: OnnxGraph, arena?: Arena, opts: SessionOptions = {}) {
-    graph = opts.fuse === false ? graph : fuseGelu(graph).graph;
+    graph = opts.fuse === false ? graph : fuseConvEpilogue(fuseGelu(graph).graph).graph;
     this.graph = graph;
     for (const [name, t] of graph.initializers) this.consts.set(name, toTensor(t));
     this.lastUse = lastUseMap(graph.nodes, graph.outputs.map((o) => o.name));
@@ -267,7 +267,14 @@ export class Session {
 
     switch (n.opType) {
       case "Conv":
-        return [convResident(r, a, x[1]!, x[2] ?? null, convAttrs(n, a, x[1]!.dims.slice(2)))];
+        return [convResident(
+          r,
+          a,
+          x[1]!,
+          x[2] ?? null,
+          convAttrs(n, a, x[1]!.dims.slice(2)),
+          n.attrs.get("activation")?.i ?? 0,
+        )];
       case "ConvTranspose": {
         const at = convAttrs(n, a, x[1]!.dims.slice(2));
         const k2s2 = at.kernel[0] === 2 && at.kernel[1] === 2 && at.strides[0] === 2 &&
@@ -346,7 +353,8 @@ export class Session {
     switch (n.opType) {
       case "Conv": {
         const at = convAttrs(n, a, x[1]!.dims.slice(2));
-        return [conv2d(a, x[1]!, x[2] ?? null, at)];
+        const y = conv2d(a, x[1]!, x[2] ?? null, at);
+        return [n.attrs.get("activation")?.i === ACT_RELU ? reluFast(y) : y];
       }
       case "ConvTranspose":
         return [convTranspose2d(a, x[1]!, x[2] ?? null, convAttrs(n, a, x[1]!.dims.slice(2)))];

@@ -14,6 +14,7 @@ export function convResident(
   w: RT,
   b: RT | null,
   a: ConvAttrs,
+  act = 0,
 ): RT {
   const [N, Cin, H, W] = x.dims;
   const [Cout, CinPer, kh, kw] = w.dims;
@@ -40,12 +41,12 @@ export function convResident(
     const xi = x.ptr + n * Cin * H * W * 4;
     const yi = out.ptr + n * Cout * OH * OW * 4;
     if (a.group === Cout && CinPer === 1) {
-      r.ar.pDepthwise([Cout, H, W, OH, OW, kh, kw, sy, sx, pt, pl, xi, w.ptr, bPtr, yi, 0]);
+      r.ar.pDepthwise([Cout, H, W, OH, OW, kh, kw, sy, sx, pt, pl, xi, w.ptr, bPtr, yi, act]);
     } else if (pointwise) {
-      r.ar.pGemm(Cout, Cin, OH * OW, w.ptr, xi, yi, bPtr, 0);
+      r.ar.pGemm(Cout, Cin, OH * OW, w.ptr, xi, yi, bPtr, act);
     } else {
       r.ar.pIm2col([Cin, H, W, OH, OW, kh, kw, sy, sx, pt, pl, dy, dx, xi, col!.ptr]);
-      r.ar.pGemm(Cout, K, OH * OW, w.ptr, col!.ptr, yi, bPtr, 0);
+      r.ar.pGemm(Cout, K, OH * OW, w.ptr, col!.ptr, yi, bPtr, act);
     }
   }
   if (col) r.ar.release(col.ptr);

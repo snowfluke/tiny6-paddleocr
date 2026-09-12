@@ -8,7 +8,7 @@ import { cropForBox, recognizeBatch } from "../src/pipeline/recognize.ts";
 import { decodePng } from "../src/image/png.ts";
 import { parseOnnx } from "../src/onnx/parse.ts";
 import { Session } from "../src/runtime/graph.ts";
-import { fuseGelu } from "../src/runtime/fuse.ts";
+import { fuseConvEpilogue, fuseGelu } from "../src/runtime/fuse.ts";
 import { loadKernels } from "../src/wasm/backend.ts";
 import { compare, unpack } from "../tools/check.ts";
 
@@ -68,15 +68,23 @@ for (const [which, dims] of [["det", [1, 3, 256, 256]], ["rec", [1, 3, 48, 320]]
 }
 
 /**
- * The goldens above run unfused, so this is what covers the fused graph:
- * folding Div -> Erf -> Add -> Mul -> Mul into one Gelu must not move the
- * output. It also pins the fusion actually firing, since a pattern matcher
- * that silently matches nothing would otherwise pass every other test.
+ * The goldens above run unfused, so this is what covers the fused graph: no
+ * fusion may move the output. It also pins each pattern actually firing, since
+ * a matcher that silently matches nothing would pass every other test.
  */
-for (const [which, dims, want] of [["det", [1, 3, 256, 256], 13], ["rec", [1, 3, 48, 320], 10]] as const) {
-  test(`fusing gelu leaves ${which} output unchanged`, async () => {
+const FUSIONS = [
+  // model, input dims, gelus folded, conv biases folded, relus folded
+  ["det", [1, 3, 256, 256], 13, 0, 19],
+  ["rec", [1, 3, 48, 320], 10, 33, 0],
+] as const;
+
+for (const [which, dims, gelus, biases, relus] of FUSIONS) {
+  test(`fusing leaves ${which} output unchanged`, async () => {
     const g = parseOnnx(await read(`models/${which}.onnx`));
-    expect(fuseGelu(g).fused).toBe(want);
+    const afterGelu = fuseGelu(g);
+    expect(afterGelu.fused).toBe(gelus);
+    const epilogue = fuseConvEpilogue(afterGelu.graph);
+    expect([epilogue.bias, epilogue.act]).toEqual([biases, relus]);
 
     const n = (dims as readonly number[]).reduce((a, b) => a * b, 1);
     const data = new Float32Array(n);
