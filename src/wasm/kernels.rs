@@ -222,6 +222,22 @@ pub unsafe extern "C" fn depthwise(
         let yp = y.add(ch * oh * ow);
         let bv = if bias.is_null() { 0.0 } else { *bias.add(ch) };
 
+        // The shapes both models use get a specialised loop: taps hoisted into
+        // registers and the stride baked in. The generic loop below is kept
+        // for anything else and for the scalar edges.
+        if sy == sx {
+            let done = match (kh, kw, sx) {
+                (3, 3, 1) => dw_rows::<3, 3, 1>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
+                (3, 3, 2) => dw_rows::<3, 3, 2>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
+                (5, 5, 1) => dw_rows::<5, 5, 1>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
+                (5, 5, 2) => dw_rows::<5, 5, 2>(xp, wp, yp, ih, iw, oh, ow, pt, pl, bv, act),
+                _ => false,
+            };
+            if done {
+                continue;
+            }
+        }
+
         // With stride 1 a 4-wide output vector reads x[ox-pl .. ox+3-pl+kw-1].
         // Both ends are in bounds exactly when pl <= ox <= iw + pl - kw - 3.
         let vec_lo = pl;
@@ -268,6 +284,140 @@ pub unsafe extern "C" fn depthwise(
 }
 
 #[inline(always)]
+/// Every fourth lane of a 12-lane window, starting at lane `kx`: the stride-2
+/// gather for one tap. Lanes 8..11 live in `v2`, which the two-vector shuffle
+/// cannot address directly, so those cases go through a second shuffle.
+#[inline(always)]
+unsafe fn even_lanes(v0: v128, v1: v128, v2: v128, kx: usize) -> v128 {
+    match kx {
+        0 => i32x4_shuffle::<0, 2, 4, 6>(v0, v1),
+        1 => i32x4_shuffle::<1, 3, 5, 7>(v0, v1),
+        2 => i32x4_shuffle::<0, 1, 2, 4>(i32x4_shuffle::<2, 4, 6, 7>(v0, v1), v2),
+        3 => i32x4_shuffle::<0, 1, 2, 5>(i32x4_shuffle::<3, 5, 7, 7>(v0, v1), v2),
+        _ => i32x4_shuffle::<0, 1, 4, 6>(i32x4_shuffle::<4, 6, 7, 7>(v0, v1), v2),
+    }
+}
+
+/// One channel of a depthwise convolution at a compile-time kernel size and
+/// stride. The taps sit in registers for the whole channel; the old loop
+/// re-splatted each one per four outputs, and had no vector path at all for
+/// stride 2, which ran every element through dw_scalar with bounds checks
+/// per tap. Measured before this: 103 MB moved in 16.4 ms at four threads,
+/// 6.3 GB/s, on a machine that does fifty.
+#[inline(always)]
+unsafe fn dw_rows<const KH: usize, const KW: usize, const SX: usize>(
+    xp: *const f32,
+    wp: *const f32,
+    yp: *mut f32,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    pt: usize,
+    pl: usize,
+    bv: f32,
+    act: u32,
+) -> bool {
+    let mut taps = [f32x4_splat(0.0); 25];
+    for i in 0..KH * KW {
+        taps[i] = f32x4_splat(*wp.add(i));
+    }
+    // A vector of four outputs at ox reads input columns from SX*ox - pl. With
+    // stride 1 the window is KW + 3 wide; with stride 2 it is the 12 lanes
+    // even_lanes gathers from. Both ends must be inside the row.
+    let window = if SX == 1 { KW + 3 } else { 12 };
+    let vec_lo = (pl + SX - 1) / SX;
+    let vec_hi = if iw + pl >= window { (iw + pl - window) / SX } else { 0 };
+    let bias = f32x4_splat(bv);
+
+    for oy in 0..oh {
+        let iy0 = (oy * SX) as isize - pt as isize;
+        let orow = yp.add(oy * ow);
+        let mut ox = 0;
+        while ox < vec_lo && ox < ow {
+            *orow.add(ox) = apply1(dw_scalar(xp, wp, ih, iw, KH, KW, iy0, (ox * SX) as isize - pl as isize, bv), act);
+            ox += 1;
+        }
+        // One accumulator chain per kernel row and two output vectors per
+        // step: a single chain of KH*KW fused multiply-adds is latency bound,
+        // the same limit the GEMM hit before it went to sixteen accumulators.
+        while ox + 8 <= ow && ox + 4 <= vec_hi {
+            let mut a0 = [bias; KH];
+            let mut a1 = [bias; KH];
+            for ky in 0..KH {
+                let iy = iy0 + ky as isize;
+                if iy < 0 || iy >= ih as isize {
+                    continue;
+                }
+                let row = xp.add(iy as usize * iw + ox * SX - pl);
+                if SX == 1 {
+                    for kx in 0..KW {
+                        let t = taps[ky * KW + kx];
+                        a0[ky] = fma(t, v128_load(row.add(kx) as *const v128), a0[ky]);
+                        a1[ky] = fma(t, v128_load(row.add(kx + 4) as *const v128), a1[ky]);
+                    }
+                } else {
+                    let v0 = v128_load(row as *const v128);
+                    let v1 = v128_load(row.add(4) as *const v128);
+                    let v2 = v128_load(row.add(8) as *const v128);
+                    let v3 = v128_load(row.add(12) as *const v128);
+                    let v4 = v128_load(row.add(16) as *const v128);
+                    for kx in 0..KW {
+                        let t = taps[ky * KW + kx];
+                        a0[ky] = fma(t, even_lanes(v0, v1, v2, kx), a0[ky]);
+                        a1[ky] = fma(t, even_lanes(v2, v3, v4, kx), a1[ky]);
+                    }
+                }
+            }
+            let mut s0 = a0[0];
+            let mut s1 = a1[0];
+            for ky in 1..KH {
+                s0 = f32x4_add(s0, a0[ky]);
+                s1 = f32x4_add(s1, a1[ky]);
+            }
+            // The bias was seeded into every chain; take the extra copies out.
+            let extra = f32x4_mul(bias, f32x4_splat((KH - 1) as f32));
+            v128_store(orow.add(ox) as *mut v128, apply(f32x4_sub(s0, extra), act));
+            v128_store(orow.add(ox + 4) as *mut v128, apply(f32x4_sub(s1, extra), act));
+            ox += 8;
+        }
+        while ox + 4 <= ow && ox <= vec_hi {
+            let mut a0 = [bias; KH];
+            for ky in 0..KH {
+                let iy = iy0 + ky as isize;
+                if iy < 0 || iy >= ih as isize {
+                    continue;
+                }
+                let row = xp.add(iy as usize * iw + ox * SX - pl);
+                if SX == 1 {
+                    for kx in 0..KW {
+                        a0[ky] = fma(taps[ky * KW + kx], v128_load(row.add(kx) as *const v128), a0[ky]);
+                    }
+                } else {
+                    let v0 = v128_load(row as *const v128);
+                    let v1 = v128_load(row.add(4) as *const v128);
+                    let v2 = v128_load(row.add(8) as *const v128);
+                    for kx in 0..KW {
+                        a0[ky] = fma(taps[ky * KW + kx], even_lanes(v0, v1, v2, kx), a0[ky]);
+                    }
+                }
+            }
+            let mut s0 = a0[0];
+            for ky in 1..KH {
+                s0 = f32x4_add(s0, a0[ky]);
+            }
+            let extra = f32x4_mul(bias, f32x4_splat((KH - 1) as f32));
+            v128_store(orow.add(ox) as *mut v128, apply(f32x4_sub(s0, extra), act));
+            ox += 4;
+        }
+        while ox < ow {
+            *orow.add(ox) = apply1(dw_scalar(xp, wp, ih, iw, KH, KW, iy0, (ox * SX) as isize - pl as isize, bv), act);
+            ox += 1;
+        }
+    }
+    true
+}
+
 unsafe fn dw_scalar(
     xp: *const f32,
     wp: *const f32,
