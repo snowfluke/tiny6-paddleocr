@@ -24,6 +24,16 @@ const ACT_NONE: u32 = 0;
 const ACT_RELU: u32 = 1;
 
 #[inline(always)]
+// One fused multiply-add. Without it the kernel is capped at half the
+// machine's FLOPs: a separate mul and add each occupy an FP unit for one
+// lane-op, where an FMA does both. The relaxed spec lets a CPU fuse or not,
+// so results can differ in the last bit between machines. That is why the
+// check against onnxruntime runs at 2e-3.
+#[inline(always)]
+unsafe fn fma(a: v128, b: v128, c: v128) -> v128 {
+    f32x4_relaxed_madd(a, b, c)
+}
+
 unsafe fn apply(v: v128, act: u32) -> v128 {
     if act == ACT_RELU { f32x4_max(v, f32x4_splat(0.0)) } else { v }
 }
@@ -93,8 +103,8 @@ pub unsafe extern "C" fn gemm_range(
                 let b1 = v128_load(brow.add(4) as *const v128);
                 for r in 0..8 {
                     let av = f32x4_splat(*a.add((mi + r) * k + kk));
-                    acc_lo[r] = f32x4_add(acc_lo[r], f32x4_mul(av, b0));
-                    acc_hi[r] = f32x4_add(acc_hi[r], f32x4_mul(av, b1));
+                    acc_lo[r] = fma(av, b0, acc_lo[r]);
+                    acc_hi[r] = fma(av, b1, acc_hi[r]);
                 }
             }
             for r in 0..8 {
@@ -139,10 +149,7 @@ unsafe fn gemm_edge(
         while j + 4 <= hi {
             let mut acc = f32x4_splat(bv0);
             for kk in 0..k {
-                acc = f32x4_add(
-                    acc,
-                    f32x4_mul(f32x4_splat(*ar.add(kk)), v128_load(b.add(kk * n + j) as *const v128)),
-                );
+                acc = fma(f32x4_splat(*ar.add(kk)), v128_load(b.add(kk * n + j) as *const v128), acc);
             }
             v128_store(cr.add(j) as *mut v128, apply(acc, act));
             j += 4;
@@ -211,12 +218,10 @@ pub unsafe extern "C" fn depthwise(
                         }
                         let row = xp.add(iy as usize * iw + ox - pl);
                         for kx in 0..kw {
-                            acc = f32x4_add(
+                            acc = fma(
+                                f32x4_splat(*wp.add(ky * kw + kx)),
+                                v128_load(row.add(kx) as *const v128),
                                 acc,
-                                f32x4_mul(
-                                    f32x4_splat(*wp.add(ky * kw + kx)),
-                                    v128_load(row.add(kx) as *const v128),
-                                ),
                             );
                         }
                     }
@@ -346,11 +351,11 @@ unsafe fn expf4(x: v128) -> v128 {
     ));
     let f = f32x4_sub(t, f32x4_convert_i32x4(k));
     let mut p = f32x4_splat(P[5]);
-    p = f32x4_add(f32x4_mul(p, f), f32x4_splat(P[4]));
-    p = f32x4_add(f32x4_mul(p, f), f32x4_splat(P[3]));
-    p = f32x4_add(f32x4_mul(p, f), f32x4_splat(P[2]));
-    p = f32x4_add(f32x4_mul(p, f), f32x4_splat(P[1]));
-    p = f32x4_add(f32x4_mul(p, f), f32x4_splat(P[0]));
+    p = fma(p, f, f32x4_splat(P[4]));
+    p = fma(p, f, f32x4_splat(P[3]));
+    p = fma(p, f, f32x4_splat(P[2]));
+    p = fma(p, f, f32x4_splat(P[1]));
+    p = fma(p, f, f32x4_splat(P[0]));
     let bias = i32x4_shl(i32x4_add(k, i32x4_splat(127)), 23);
     f32x4_mul(p, bias)
 }
@@ -378,10 +383,10 @@ unsafe fn erff4(x: v128) -> v128 {
     let a = f32x4_abs(x);
     let t = f32x4_div(f32x4_splat(1.0), f32x4_add(f32x4_splat(1.0), f32x4_mul(f32x4_splat(EP), a)));
     let mut poly = f32x4_splat(E5);
-    poly = f32x4_add(f32x4_mul(poly, t), f32x4_splat(E4));
-    poly = f32x4_add(f32x4_mul(poly, t), f32x4_splat(E3));
-    poly = f32x4_add(f32x4_mul(poly, t), f32x4_splat(E2));
-    poly = f32x4_add(f32x4_mul(poly, t), f32x4_splat(E1));
+    poly = fma(poly, t, f32x4_splat(E4));
+    poly = fma(poly, t, f32x4_splat(E3));
+    poly = fma(poly, t, f32x4_splat(E2));
+    poly = fma(poly, t, f32x4_splat(E1));
     let e = expf4(f32x4_neg(f32x4_mul(a, a)));
     let y = f32x4_sub(f32x4_splat(1.0), f32x4_mul(f32x4_mul(poly, t), e));
     v128_or(y, sign)
@@ -488,7 +493,7 @@ pub unsafe extern "C" fn unary(op: u32, n: usize, a: *const f32, out: *mut f32, 
             2 => erff4(x),
             _ => f32x4_min(
                 one,
-                f32x4_max(zero, f32x4_add(f32x4_mul(f32x4_splat(p0), x), f32x4_splat(p1))),
+                f32x4_max(zero, fma(f32x4_splat(p0), x, f32x4_splat(p1))),
             ),
         };
         v128_store(out.add(i) as *mut v128, r);

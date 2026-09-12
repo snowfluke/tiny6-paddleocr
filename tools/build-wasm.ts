@@ -22,7 +22,7 @@ async function build(out: string, extra: string[]) {
   console.log(`${out.padEnd(32)} ${Bun.file(out).size} bytes`);
 }
 
-await build("src/wasm/kernels.wasm", ["-C", "target-feature=+simd128"]);
+await build("src/wasm/kernels.wasm", ["-C", "target-feature=+simd128,+relaxed-simd"]);
 
 const { makeMemoryShared } = await import("./share-memory.ts");
 const plain = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
