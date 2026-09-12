@@ -19,6 +19,7 @@ export type Kernels = {
     c: number,
     bias: number,
     act: number,
+    res: number,
     lo: number,
     hi: number,
   ): void;
@@ -97,6 +98,7 @@ export type Kernels = {
     c: number,
     bias: number,
     act: number,
+    res: number,
   ): void;
   depthwise(
     channels: number,
@@ -177,11 +179,12 @@ export class Arena {
     act: number,
     ldb = n,
     ldc = n,
+    res = 0,
   ) {
     if (this.pool && m * n >= PARALLEL_MIN) {
-      this.pool.dispatch(JOB.gemm, [m, k, n, ldb, ldc, a, b, c, bias, act]);
+      this.pool.dispatch(JOB.gemm, [m, k, n, ldb, ldc, a, b, c, bias, act, res]);
     } else {
-      this.k.gemm(m, k, n, ldb, ldc, a, b, c, bias, act);
+      this.k.gemm(m, k, n, ldb, ldc, a, b, c, bias, act, res);
     }
   }
 
@@ -192,7 +195,7 @@ export class Arena {
       this.pool.dispatch(JOB.convStrip, args);
     } else {
       this.k.im2col_strip(ih, iw, ow, kh, kw, sy, sx, pt, pl, dy, dx, p0, width, x, col, 0, cin);
-      this.k.gemm_range(m, k, width, width, ldc, w, col, cbase, bias, act, 0, width);
+      this.k.gemm_range(m, k, width, width, ldc, w, col, cbase, bias, act, 0, 0, width);
     }
   }
 

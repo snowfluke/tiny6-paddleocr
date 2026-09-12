@@ -281,6 +281,7 @@ export class Session {
           x[2] ?? null,
           convAttrs(n, a, x[1]!.dims.slice(2)),
           n.attrs.get("activation")?.i ?? 0,
+          x[3] ?? null,
         )];
       case "ConvTranspose": {
         const at = convAttrs(n, a, x[1]!.dims.slice(2));
@@ -371,7 +372,8 @@ export class Session {
     switch (n.opType) {
       case "Conv": {
         const at = convAttrs(n, a, x[1]!.dims.slice(2));
-        const y = conv2d(a, x[1]!, x[2] ?? null, at);
+        const y0 = conv2d(a, x[1]!, x[2] ?? null, at);
+        const y = x[3] ? binaryFast(y0, x[3], "add") : y0;
         return [n.attrs.get("activation")?.i === ACT_RELU ? reluFast(y) : y];
       }
       case "ConvTranspose":

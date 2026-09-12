@@ -22,6 +22,7 @@ export function convResident(
   b: RT | null,
   a: ConvAttrs,
   act = 0,
+  residual: RT | null = null,
 ): RT {
   const [N, Cin, H, W] = x.dims;
   const [Cout, CinPer, kh, kw] = w.dims;
@@ -37,6 +38,9 @@ export function convResident(
   }
 
   const pointwise = kh === 1 && kw === 1 && sy === 1 && sx === 1 && !pt && !pl && !pb && !pr;
+  if (residual && (!pointwise || residual.len !== out.len)) {
+    throw new Error("convResident: a fused residual needs a 1x1 conv of the same shape");
+  }
   const K = Cin * kh * kw;
   const plane = OH * OW;
 
@@ -60,7 +64,8 @@ export function convResident(
     if (a.group === Cout && CinPer === 1) {
       r.ar.pDepthwise([Cout, H, W, OH, OW, kh, kw, sy, sx, pt, pl, xi, w.ptr, bPtr, yi, act]);
     } else if (pointwise) {
-      r.ar.pGemm(Cout, Cin, OH * OW, w.ptr, xi, yi, bPtr, act);
+      const res = residual ? residual.ptr + n * Cout * OH * OW * 4 : 0;
+      r.ar.pGemm(Cout, Cin, OH * OW, w.ptr, xi, yi, bPtr, act, OH * OW, OH * OW, res);
     } else {
       for (let p0 = 0; p0 < plane; p0 += strip) {
         const width = Math.min(strip, plane - p0);

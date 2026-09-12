@@ -105,13 +105,14 @@ function soleReader(g: OnnxGraph, readers: Map<string, number>, name: string, op
  * A residual Add, where both inputs are activations, is not this and is left
  * alone; detection's 10 post-conv Adds are all that kind.
  */
-export function fuseConvEpilogue(g: OnnxGraph): { graph: OnnxGraph; bias: number; act: number } {
+export function fuseConvEpilogue(g: OnnxGraph): { graph: OnnxGraph; bias: number; act: number; residual: number } {
   const readers = readerCount(g);
   const drop = new Set<OnnxNode>();
   const rewrite = new Map<OnnxNode, OnnxNode>();
   const initializers = new Map(g.initializers);
   let bias = 0;
   let act = 0;
+  let residual = 0;
 
   for (const conv of g.nodes) {
     if (conv.opType !== "Conv") continue;
@@ -133,6 +134,21 @@ export function fuseConvEpilogue(g: OnnxGraph): { graph: OnnxGraph; bias: number
       }
     }
 
+    // A residual Add, both inputs activations, rides along as a fourth input
+    // and is summed in the GEMM epilogue. onnxruntime calls this Conv Add
+    // Activation fusion. Only 1x1 convolutions get it here; the runtime
+    // throws if the shapes disagree rather than silently misreading.
+    const w = g.initializers.get(node.input[1]);
+    const resAdd = soleReader(g, readers, node.output[0], "Add");
+    if (resAdd && w && w.dims[2] === 1 && w.dims[3] === 1) {
+      const other = resAdd.input.find((i) => i !== node.output[0])!;
+      if (!initializers.has(other) && g.nodes.findIndex((m) => m.output.includes(other)) < g.nodes.indexOf(conv)) {
+        node = { ...node, input: [node.input[0], node.input[1], node.input[2] ?? "", other], output: resAdd.output };
+        drop.add(resAdd);
+        residual++;
+      }
+    }
+
     const relu = soleReader(g, readers, node.output[0], "Relu");
     if (relu) {
       node = {
@@ -147,7 +163,7 @@ export function fuseConvEpilogue(g: OnnxGraph): { graph: OnnxGraph; bias: number
     if (node !== conv) rewrite.set(conv, node);
   }
 
-  if (!drop.size) return { graph: g, bias, act };
+  if (!drop.size) return { graph: g, bias, act, residual };
   const nodes = g.nodes.filter((n) => !drop.has(n)).map((n) => rewrite.get(n) ?? n);
-  return { graph: { ...g, nodes, initializers }, bias, act };
+  return { graph: { ...g, nodes, initializers }, bias, act, residual };
 }

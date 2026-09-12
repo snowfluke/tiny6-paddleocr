@@ -53,7 +53,7 @@ function runShare(k, c, index, count) {
   const a = 3;
   if (op === ${JOB.gemm}) {
     const [lo, hi] = shareBy8(c[a + 2], index, count);
-    if (lo < hi) k.gemm_range(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], lo, hi);
+    if (lo < hi) k.gemm_range(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], lo, hi);
   } else if (op === ${JOB.depthwise}) {
     const [lo, hi] = share(c[a], index, count);
     if (lo < hi) k.depthwise(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], lo, hi);
@@ -69,7 +69,7 @@ function runShare(k, c, index, count) {
       const k_ = c[a + 17];
       const colw = c[a + 15] + lo * k_ * 4;
       k.im2col_strip(c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12] + lo, hi - lo, c[a+14], colw, 0, c[a]);
-      k.gemm_range(c[a+16], k_, hi - lo, hi - lo, c[a+22], c[a+18], colw, c[a+19] + lo * 4, c[a+20], c[a+21], 0, hi - lo);
+      k.gemm_range(c[a+16], k_, hi - lo, hi - lo, c[a+22], c[a+18], colw, c[a+19] + lo * 4, c[a+20], c[a+21], 0, 0, hi - lo);
     }
       } else if (op === ${JOB.unary}) {
     const [lo, hi] = share(c[a + 1], index, count);

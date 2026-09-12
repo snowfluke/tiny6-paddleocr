@@ -56,8 +56,9 @@ pub unsafe extern "C" fn gemm(
     c: *mut f32,
     bias: *const f32,
     act: u32,
+    res: *const f32,
 ) {
-    gemm_range(m, k, n, ldb, ldc, a, b, c, bias, act, 0, n);
+    gemm_range(m, k, n, ldb, ldc, a, b, c, bias, act, res, 0, n);
 }
 
 /// The same GEMM restricted to output columns [lo, hi). Column ranges are
@@ -84,6 +85,7 @@ unsafe fn tile8x8(
     c: *mut f32,
     bias: *const f32,
     act: u32,
+    res: *const f32,
 ) {
     let mut acc_lo = [f32x4_splat(0.0); 8];
     let mut acc_hi = [f32x4_splat(0.0); 8];
@@ -102,10 +104,18 @@ unsafe fn tile8x8(
             acc_hi[r] = fma(av, b1, acc_hi[r]);
         }
     }
+    // A fused residual is read at C's own index: the Add that followed the
+    // convolution was a full pass over the tensor for nothing else.
     for r in 0..8 {
         let cr = c.add((mi + r) * ldc + j);
-        v128_store(cr as *mut v128, apply(acc_lo[r], act));
-        v128_store(cr.add(4) as *mut v128, apply(acc_hi[r], act));
+        let (mut lo, mut hi) = (acc_lo[r], acc_hi[r]);
+        if !res.is_null() {
+            let rr = res.add((mi + r) * ldc + j);
+            lo = f32x4_add(lo, v128_load(rr as *const v128));
+            hi = f32x4_add(hi, v128_load(rr.add(4) as *const v128));
+        }
+        v128_store(cr as *mut v128, apply(lo, act));
+        v128_store(cr.add(4) as *mut v128, apply(hi, act));
     }
 }
 
@@ -121,6 +131,7 @@ pub unsafe extern "C" fn gemm_range(
     c: *mut f32,
     bias: *const f32,
     act: u32,
+    res: *const f32,
     lo: usize,
     hi: usize,
 ) {
@@ -138,7 +149,7 @@ pub unsafe extern "C" fn gemm_range(
     while mi < m8 {
         let mut j = lo;
         while j < j_end {
-            tile8x8(mi, j, k, ldb, ldc, a, b, c, bias, act);
+            tile8x8(mi, j, k, ldb, ldc, a, b, c, bias, act, res);
             j += 8;
         }
         mi += 8;
@@ -146,12 +157,13 @@ pub unsafe extern "C" fn gemm_range(
 
     // Columns past the last multiple of eight, for every row.
     if j_end < hi {
-        gemm_edge(m, k, ldb, ldc, a, b, c, bias, act, j_end, hi);
+        gemm_edge(m, k, ldb, ldc, a, b, c, bias, act, res, j_end, hi);
     }
     // Rows past the last multiple of eight, for the columns the block covered.
     if m8 < m && lo < j_end {
         let bias_tail = if bias.is_null() { bias } else { bias.add(m8) };
-        gemm_edge(m - m8, k, ldb, ldc, a.add(m8 * k), b, c.add(m8 * ldc), bias_tail, act, lo, j_end);
+        let res_tail = if res.is_null() { res } else { res.add(m8 * ldc) };
+        gemm_edge(m - m8, k, ldb, ldc, a.add(m8 * k), b, c.add(m8 * ldc), bias_tail, act, res_tail, lo, j_end);
     }
 }
 
@@ -166,6 +178,7 @@ unsafe fn gemm_edge(
     c: *mut f32,
     bias: *const f32,
     act: u32,
+    res: *const f32,
     lo: usize,
     hi: usize,
 ) {
@@ -179,6 +192,9 @@ unsafe fn gemm_edge(
             for kk in 0..k {
                 acc = fma(f32x4_splat(*ar.add(kk)), v128_load(b.add(kk * ldb + j) as *const v128), acc);
             }
+            if !res.is_null() {
+                acc = f32x4_add(acc, v128_load(res.add(mi * ldc + j) as *const v128));
+            }
             v128_store(cr.add(j) as *mut v128, apply(acc, act));
             j += 4;
         }
@@ -186,6 +202,9 @@ unsafe fn gemm_edge(
             let mut s = bv0;
             for kk in 0..k {
                 s += *ar.add(kk) * *b.add(kk * ldb + j);
+            }
+            if !res.is_null() {
+                s += *res.add(mi * ldc + j);
             }
             *cr.add(j) = apply1(s, act);
             j += 1;

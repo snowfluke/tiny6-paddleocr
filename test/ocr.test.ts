@@ -73,18 +73,18 @@ for (const [which, dims] of [["det", [1, 3, 256, 256]], ["rec", [1, 3, 48, 320]]
  * a matcher that silently matches nothing would pass every other test.
  */
 const FUSIONS = [
-  // model, input dims, gelus folded, conv biases folded, relus folded
-  ["det", [1, 3, 256, 256], 13, 0, 19],
-  ["rec", [1, 3, 48, 320], 10, 33, 0],
+  // model, input dims, gelus folded, conv biases folded, relus folded, residuals
+  ["det", [1, 3, 256, 256], 13, 0, 19, 10],
+  ["rec", [1, 3, 48, 320], 10, 33, 0, 0],
 ] as const;
 
-for (const [which, dims, gelus, biases, relus] of FUSIONS) {
+for (const [which, dims, gelus, biases, relus, residuals] of FUSIONS) {
   test(`fusing leaves ${which} output unchanged`, async () => {
     const g = parseOnnx(await read(`models/${which}.onnx`));
     const afterGelu = fuseGelu(g);
     expect(afterGelu.fused).toBe(gelus);
     const epilogue = fuseConvEpilogue(afterGelu.graph);
-    expect([epilogue.bias, epilogue.act]).toEqual([biases, relus]);
+    expect([epilogue.bias, epilogue.act, epilogue.residual]).toEqual([biases, relus, residuals]);
 
     const n = (dims as readonly number[]).reduce((a, b) => a * b, 1);
     const data = new Float32Array(n);
