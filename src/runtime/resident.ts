@@ -59,6 +59,9 @@ export class Resident {
       this.ar.k.binary(op, 2, n, n / (dims[0] * dims[1]), dims[1], a.ptr, b.ptr, out.ptr);
     } else if (dims.length === 4 && b.len === n && a.len === dims[1]) {
       this.ar.k.binary(op, 3, n, n / (dims[0] * dims[1]), dims[1], a.ptr, b.ptr, out.ptr);
+    } else if (a.len === n && b.len === dims[dims.length - 1]) {
+      // [1, R, C] + [C]: the trailing vector repeats over every row.
+      this.ar.k.binary(op, 4, n, b.len, 0, a.ptr, b.ptr, out.ptr);
     } else {
       this.ar.release(out.ptr);
       return null as unknown as RT;
@@ -105,6 +108,63 @@ export class Resident {
       }
       off += block;
     }
+    return out;
+  }
+
+  /**
+   * Batch normalisation, folded to one pass. scale and shift are derived from
+   * the four constants on every call, which is a few hundred flops against a
+   * tensor of tens of thousands, and keeps them out of the sealed weight area.
+   */
+  batchNorm(a: RT, gamma: RT, beta: RT, mean: RT, variance: RT, eps: number): RT {
+    const c = gamma.len;
+    const axis = a.dims.length >= 2 ? 1 : 0;
+    const inner = a.dims.slice(axis + 1).reduce((x, y) => x * y, 1);
+    const g = this.download(gamma).data;
+    const bt = this.download(beta).data;
+    const m = this.download(mean).data;
+    const v = this.download(variance).data;
+    const s = new Float32Array(c);
+    const t = new Float32Array(c);
+    for (let i = 0; i < c; i++) {
+      s[i] = g[i] / Math.sqrt(v[i] + eps);
+      t[i] = bt[i] - m[i] * s[i];
+    }
+    const sRT = this.alloc([c]);
+    const tRT = this.alloc([c]);
+    this.ar.write(sRT.ptr, s);
+    this.ar.write(tRT.ptr, t);
+    const out = this.alloc(a.dims.slice());
+    this.ar.pAffineChannels(a.len, inner, c, a.ptr, sRT.ptr, tRT.ptr, out.ptr);
+    this.ar.release(sRT.ptr);
+    this.ar.release(tRT.ptr);
+    return out;
+  }
+
+  /** Softmax over the trailing axis, which is the only axis either model uses. */
+  softmaxLast(a: RT): RT {
+    const cols = a.dims[a.dims.length - 1];
+    const out = this.alloc(a.dims.slice());
+    this.ar.pSoftmaxRows(a.len / cols, cols, a.ptr, out.ptr);
+    return out;
+  }
+
+  /** Rank-4 and below; the permutation is left-padded with identity axes. */
+  transpose(a: RT, perm: number[]): RT {
+    const rank = a.dims.length;
+    if (rank > 4) return null as unknown as RT;
+    const pad = 4 - rank;
+    const dims = [...Array(pad).fill(1), ...a.dims];
+    const p = [...Array(pad).fill(0).map((_, i) => i), ...perm.map((v) => v + pad)];
+    const stride = [0, 0, 0, 1];
+    for (let i = 2; i >= 0; i--) stride[i] = stride[i + 1] * dims[i + 1];
+    const outDims = p.map((i) => dims[i]);
+    const out = this.alloc(perm.map((i) => a.dims[i]));
+    this.ar.k.transpose4(
+      outDims[0], outDims[1], outDims[2], outDims[3],
+      stride[p[0]], stride[p[1]], stride[p[2]], stride[p[3]],
+      a.ptr, out.ptr,
+    );
     return out;
   }
 

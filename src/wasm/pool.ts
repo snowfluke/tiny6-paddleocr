@@ -13,6 +13,8 @@ export const JOB = {
   unary: 4,
   binary: 5,
   scatter2x2: 6,
+  softmax: 7,
+  affine: 8,
 } as const;
 
 /** Int32 slots in the control block: 0 sequence, 1 completions, 2 op, 3+ args. */
@@ -51,6 +53,12 @@ function runShare(k, c, index, count) {
   } else if (op === ${JOB.binary}) {
     const [lo, hi] = share(c[a + 2], index, count);
     if (lo < hi) k.binary(c[a], 0, hi - lo, 0, 0, c[a + 3] + lo * 4, c[a + 4] + lo * 4, c[a + 5] + lo * 4);
+  } else if (op === ${JOB.affine}) {
+    const [lo, hi] = share(c[a], index, count);
+    if (lo < hi) k.affine_channels(c[a + 1], c[a + 2], c[a], c[a + 3], c[a + 4], c[a + 5], c[a + 6], lo, hi);
+  } else if (op === ${JOB.softmax}) {
+    const [lo, hi] = share(c[a], index, count);
+    if (lo < hi) k.softmax_rows(c[a + 1], c[a + 2], c[a + 3], lo, hi);
   } else if (op === ${JOB.scatter2x2}) {
     const [lo, hi] = share(c[a], index, count);
     if (lo < hi) k.scatter2x2(c[a + 1], c[a + 2], c[a + 3], c[a + 4], c[a + 5], c[a + 6], lo, hi);

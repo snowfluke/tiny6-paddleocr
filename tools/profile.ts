@@ -26,7 +26,7 @@ const byOp = new Map<string, { ms: number; n: number }>();
 let last = performance.now();
 const t0 = last;
 s.run(feeds, {
-  onNode: (node) => {
+  onNodeDone: (node) => {
     const now = performance.now();
     const e = byOp.get(node.opType) ?? { ms: 0, n: 0 };
     e.ms += now - last;

@@ -126,8 +126,14 @@ export type SessionOptions = {
 };
 
 export type RunOptions = {
-  /** Called after every node, for golden-diffing. */
+  /** Called after every node, for golden-diffing. Downloads every output. */
   onNode?: (node: OnnxNode, outputs: Tensor[]) => void;
+  /**
+   * Called after every node without materialising anything. Use this to time
+   * nodes: onNode copies each output out of wasm memory, which on the resident
+   * path costs more than most of the ops being measured.
+   */
+  onNodeDone?: (node: OnnxNode) => void;
 };
 
 export class Session {
@@ -205,6 +211,7 @@ export class Session {
         r.ar.retain(outs[j].ptr);
       }
       if (opts.onNode) opts.onNode(node, outs.map((o) => r.download(o)));
+      if (opts.onNodeDone) opts.onNodeDone(node);
       // A buffer goes back on the free list once its last reader has run.
       for (const name of this.releaseAt[i]) {
         const t = env.get(name);
@@ -336,6 +343,17 @@ export class Session {
         const dims = parts[0].dims.slice();
         dims[ax] = parts.reduce((sum, p) => sum + p.dims[ax], 0);
         return [r.concat(parts, ax, dims)];
+      }
+      case "BatchNormalization":
+        return [r.batchNorm(a, x[1]!, x[2]!, x[3]!, x[4]!, n.attrs.get("epsilon")?.f ?? 1e-5)];
+      case "Softmax": {
+        const ax = n.attrs.get("axis")?.i ?? -1;
+        const last = ax === -1 || ax === a.dims.length - 1;
+        return last ? [r.softmaxLast(a)] : fallback();
+      }
+      case "Transpose": {
+        const perm = n.attrs.get("perm")?.ints ?? a.dims.map((_, i) => a.dims.length - 1 - i);
+        return [r.transpose(a, perm) ?? fallback()[0]];
       }
       case "Resize": {
         const scales = x[2] ? [...r.download(x[2]).data] : [];

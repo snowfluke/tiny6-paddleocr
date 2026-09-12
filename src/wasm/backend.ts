@@ -19,6 +19,30 @@ export type Kernels = {
   unary(op: number, n: number, a: number, out: number, p0: number, p1: number): void;
   reduce_mean(outer: number, inner: number, a: number, out: number): void;
   maxpool2x2(planes: number, h: number, w: number, a: number, out: number, lo: number, hi: number): void;
+  affine_channels(
+    n: number,
+    inner: number,
+    channels: number,
+    a: number,
+    s: number,
+    t: number,
+    out: number,
+    cLo: number,
+    cHi: number,
+  ): void;
+  softmax_rows(cols: number, a: number, out: number, rLo: number, rHi: number): void;
+  transpose4(
+    d0: number,
+    d1: number,
+    d2: number,
+    d3: number,
+    s0: number,
+    s1: number,
+    s2: number,
+    s3: number,
+    a: number,
+    out: number,
+  ): void;
   scatter2x2(
     h: number,
     w: number,
@@ -161,6 +185,22 @@ export class Arena {
   pBinarySame(op: number, n: number, a: number, b: number, out: number) {
     if (this.pool && n >= PARALLEL_MIN) this.pool.dispatch(JOB.binary, [op, 0, n, a, b, out]);
     else this.k.binary(op, 0, n, 0, 0, a, b, out);
+  }
+
+  pAffineChannels(n: number, inner: number, channels: number, a: number, s: number, t: number, out: number) {
+    if (this.pool && n >= PARALLEL_MIN && channels > 1) {
+      this.pool.dispatch(JOB.affine, [channels, n, inner, a, s, t, out]);
+    } else {
+      this.k.affine_channels(n, inner, channels, a, s, t, out, 0, channels);
+    }
+  }
+
+  pSoftmaxRows(rows: number, cols: number, a: number, out: number) {
+    if (this.pool && rows * cols >= PARALLEL_MIN && rows > 1) {
+      this.pool.dispatch(JOB.softmax, [rows, cols, a, out]);
+    } else {
+      this.k.softmax_rows(cols, a, out, 0, rows);
+    }
   }
 
   pScatter2x2(planes: number, h: number, w: number, ky: number, kx: number, src: number, dst: number) {

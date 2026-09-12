@@ -398,6 +398,24 @@ unsafe fn erff4(x: v128) -> v128 {
 /// mode: 0 same shape, 1 b is one scalar, 2 b is per-channel, 3 a is per-channel.
 /// `inner` is the elements per channel and `channels` the channel count; both
 /// are ignored unless the mode is per-channel.
+/// Elementwise over two equal-length runs. Kept out of `binary` so that
+/// function stays a leaf: making it call itself for the broadcast mode cost
+/// detection 8%, because every elementwise op in the model goes through mode 0.
+#[inline(always)]
+unsafe fn elementwise(op: u32, n: usize, a: *const f32, b: *const f32, out: *mut f32) {
+    let mut i = 0;
+    while i + 4 <= n {
+        let av = v128_load(a.add(i) as *const v128);
+        let bv = v128_load(b.add(i) as *const v128);
+        v128_store(out.add(i) as *mut v128, apply_bin(op, av, bv));
+        i += 4;
+    }
+    while i < n {
+        *out.add(i) = apply_bin1(op, *a.add(i), *b.add(i));
+        i += 1;
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn binary(
     op: u32,
@@ -410,20 +428,15 @@ pub unsafe extern "C" fn binary(
     out: *mut f32,
 ) {
     match mode {
-        0 => {
-            let mut i = 0;
-            while i + 4 <= n {
-                let av = v128_load(a.add(i) as *const v128);
-                let bv = v128_load(b.add(i) as *const v128);
-                v128_store(out.add(i) as *mut v128, apply_bin(op, av, bv));
-                i += 4;
-            }
-            while i < n {
-                *out.add(i) = apply_bin1(op, *a.add(i), *b.add(i));
-                i += 1;
+        0 => elementwise(op, n, a, b, out),
+        1 => splat_rhs(op, n, a, *b, out, false),
+        // b is the trailing axis repeated over every row: [1, R, C] + [C].
+        4 => {
+            let rows = n / inner;
+            for o in 0..rows {
+                elementwise(op, inner, a.add(o * inner), b, out.add(o * inner));
             }
         }
-        1 => splat_rhs(op, n, a, *b, out, false),
         2 | 3 => {
             let outer = n / (inner * channels);
             for o in 0..outer {
@@ -521,6 +534,126 @@ pub unsafe extern "C" fn unary(op: u32, n: usize, a: *const f32, out: *mut f32, 
 }
 
 /// Mean over a contiguous trailing run, one output per `inner`-sized block.
+/// Per-channel affine: y = x * s[c] + t[c], with the channel running over
+/// `channels` blocks of `inner` elements. Batch normalisation collapses to
+/// this once its four constants are folded into a scale and a shift.
+#[no_mangle]
+pub unsafe extern "C" fn affine_channels(
+    n: usize,
+    inner: usize,
+    channels: usize,
+    a: *const f32,
+    s: *const f32,
+    t: *const f32,
+    out: *mut f32,
+    c_lo: usize,
+    c_hi: usize,
+) {
+    let outer = n / (inner * channels);
+    for o in 0..outer {
+        for c in c_lo..c_hi {
+            let base = (o * channels + c) * inner;
+            let sv = f32x4_splat(*s.add(c));
+            let tv = f32x4_splat(*t.add(c));
+            let ap = a.add(base);
+            let op = out.add(base);
+            let mut i = 0;
+            while i + 4 <= inner {
+                v128_store(
+                    op.add(i) as *mut v128,
+                    fma(v128_load(ap.add(i) as *const v128), sv, tv),
+                );
+                i += 4;
+            }
+            while i < inner {
+                *op.add(i) = *ap.add(i) * *s.add(c) + *t.add(c);
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Softmax over the trailing axis: `rows` rows of `cols` each. Subtracting the
+/// row maximum before exp is what keeps the classifier's 6906 logits finite.
+#[no_mangle]
+pub unsafe extern "C" fn softmax_rows(
+    cols: usize,
+    a: *const f32,
+    out: *mut f32,
+    r_lo: usize,
+    r_hi: usize,
+) {
+    for r in r_lo..r_hi {
+        let ar = a.add(r * cols);
+        let orow = out.add(r * cols);
+        let mut m = f32::NEG_INFINITY;
+        for i in 0..cols {
+            let v = *ar.add(i);
+            if v > m {
+                m = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        let mv = f32x4_splat(m);
+        let mut i = 0;
+        while i + 4 <= cols {
+            let e = expf4(f32x4_sub(v128_load(ar.add(i) as *const v128), mv));
+            v128_store(orow.add(i) as *mut v128, e);
+            sum += f32x4_extract_lane::<0>(e) + f32x4_extract_lane::<1>(e)
+                + f32x4_extract_lane::<2>(e) + f32x4_extract_lane::<3>(e);
+            i += 4;
+        }
+        while i < cols {
+            let e = expf(*ar.add(i) - m);
+            *orow.add(i) = e;
+            sum += e;
+            i += 1;
+        }
+        let inv = f32x4_splat(1.0 / sum);
+        let mut j = 0;
+        while j + 4 <= cols {
+            v128_store(
+                orow.add(j) as *mut v128,
+                f32x4_mul(v128_load(orow.add(j) as *const v128), inv),
+            );
+            j += 4;
+        }
+        while j < cols {
+            *orow.add(j) *= 1.0 / sum;
+            j += 1;
+        }
+    }
+}
+
+/// Rank-4 transpose. Ranks below four are passed left-padded with ones, so one
+/// kernel covers the 3D permutes the recognition head does.
+#[no_mangle]
+pub unsafe extern "C" fn transpose4(
+    d0: usize,
+    d1: usize,
+    d2: usize,
+    d3: usize,
+    s0: usize,
+    s1: usize,
+    s2: usize,
+    s3: usize,
+    a: *const f32,
+    out: *mut f32,
+) {
+    let mut o = 0;
+    for i0 in 0..d0 {
+        for i1 in 0..d1 {
+            for i2 in 0..d2 {
+                let base = i0 * s0 + i1 * s1 + i2 * s2;
+                for i3 in 0..d3 {
+                    *out.add(o) = *a.add(base + i3 * s3);
+                    o += 1;
+                }
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn reduce_mean(outer: usize, inner: usize, a: *const f32, out: *mut f32) {
     for o in 0..outer {
