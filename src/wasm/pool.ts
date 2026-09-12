@@ -97,6 +97,8 @@ onmessage = async (e) => {
   const d = e.data;
   const { instance } = await WebAssembly.instantiate(d.bytes, { env: { memory: d.memory } });
   k = instance.exports;
+  // Own shadow stack; see Arena.attach.
+  k.__stack_pointer.value = d.stackTop;
   c = new Int32Array(d.memory.buffer, d.ctrl, ${CTRL_SLOTS});
   f = new Float32Array(d.memory.buffer, d.ctrl, ${CTRL_SLOTS});
   index = d.index;
@@ -144,6 +146,8 @@ export class Pool {
     kernels: unknown,
     ctrlPtr: number,
     threads: number,
+    stackBase: number,
+    stackBytes: number,
   ): Promise<Pool> {
     const pool = new Pool(threads, kernels, memory, ctrlPtr);
     if (threads <= 1) return pool;
@@ -157,7 +161,9 @@ export class Pool {
         return new Promise<void>((resolve, reject) => {
           w.onmessage = () => resolve();
           w.onerror = (e) => reject(new Error(`worker failed: ${(e as ErrorEvent).message ?? e}`));
-          w.postMessage({ bytes, memory, ctrl: ctrlPtr, index: i + 1, count: threads });
+          // Stacks grow down, so a worker starts at the top of its slice.
+          const stackTop = stackBase + (i + 1) * stackBytes;
+          w.postMessage({ bytes, memory, ctrl: ctrlPtr, index: i + 1, count: threads, stackTop });
         });
       }),
     );

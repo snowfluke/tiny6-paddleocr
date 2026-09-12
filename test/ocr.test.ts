@@ -9,7 +9,7 @@ import { decodePng } from "../src/image/png.ts";
 import { parseOnnx } from "../src/onnx/parse.ts";
 import { Session } from "../src/runtime/graph.ts";
 import { fuseConvEpilogue, fuseGelu } from "../src/runtime/fuse.ts";
-import { loadKernels } from "../src/wasm/backend.ts";
+import { loadKernels, loadKernelsThreaded } from "../src/wasm/backend.ts";
 import { compare, unpack } from "../tools/check.ts";
 
 const read = async (p: string) => new Uint8Array(await Bun.file(p).arrayBuffer());
@@ -139,6 +139,48 @@ test("reads short upright text exactly", async () => {
   const lines = ocr.recognize(await decodePng(await read("test/images/tilted.png")));
   expect(lines[0].text).toBe("Hello, mom!");
   ocr.destroy();
+}, 120_000);
+
+/**
+ * Text equality is too coarse: a kernel that raced across workers corrupted
+ * a handful of activations in a 5x5 depthwise layer and the text still came
+ * out right most runs. Every node's output must match the single-threaded
+ * run exactly, and repeatedly, since a race only shows on some schedules.
+ */
+test("worker threads are bit-identical at every node", async () => {
+  const g = parseOnnx(await read("models/det.onnx"));
+  const dims = [1, 3, 256, 320];
+  const n = dims.reduce((a, b) => a * b, 1);
+  const data = new Float32Array(n);
+  let seed = 3;
+  for (let i = 0; i < n; i++) {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    data[i] = (seed / 0xffffffff) * 2 - 1;
+  }
+  const feeds = { [g.inputs[0].name]: { dims, data } };
+  const one = new Session(g, await loadKernels(wasm));
+  const ref = new Map<string, Float32Array>();
+  one.run(feeds, { onNode: (node, outs) => node.output.forEach((o, i) => ref.set(o, outs[i].data)) });
+
+  const arena = await loadKernelsThreaded(sharedWasm, 4);
+  const four = new Session(g, arena);
+  const bad: string[] = [];
+  for (let rep = 0; rep < 6; rep++) {
+    four.run(feeds, {
+      onNode: (node, outs) => node.output.forEach((o, i) => {
+        const a = ref.get(o)!;
+        const b = outs[i].data;
+        for (let j = 0; j < a.length; j++) {
+          if (a[j] !== b[j]) {
+            bad.push(`run ${rep}: ${node.opType} ${o} differs at ${j}`);
+            return;
+          }
+        }
+      }),
+    });
+  }
+  arena.destroy();
+  expect(bad).toEqual([]);
 }, 120_000);
 
 test("worker threads change nothing but the wall clock", async () => {

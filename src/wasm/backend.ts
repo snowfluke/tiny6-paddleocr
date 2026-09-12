@@ -5,6 +5,9 @@ import { CTRL_BYTES, defaultThreads, JOB, PARALLEL_MIN, Pool } from "./pool.ts";
 // Weights are uploaded once and kept (persistent, grows up from heap_base).
 // Activations are scratch: every call takes a mark and rewinds to it on exit.
 
+/** Shadow stack per worker. The kernels spill at most a few kilobytes. */
+const WORKER_STACK_BYTES = 256 * 1024;
+
 export type Kernels = {
   memory?: WebAssembly.Memory;
   heap_base(): number;
@@ -155,7 +158,13 @@ export class Arena {
 
   async startPool(bytes: Uint8Array, threads: number) {
     if (threads <= 1) return;
-    this.pool = await Pool.create(bytes, this.memory, this.k, this.ctrlPtr, threads);
+    // Every worker instantiates the same module on the same shared memory,
+    // so without this they all place their shadow stack at the same address
+    // and any kernel that spills a local races with the other three. It
+    // stayed hidden until the 5x5 depthwise kernel spilled its 25 taps. Each
+    // worker gets its own region here, below the seal so it is never reused.
+    const stackBase = this.alloc(((threads - 1) * WORKER_STACK_BYTES) / 4);
+    this.pool = await Pool.create(bytes, this.memory, this.k, this.ctrlPtr, threads, stackBase, WORKER_STACK_BYTES);
   }
 
   destroy() {

@@ -8,6 +8,7 @@ const COMMON = [
   "-C", "debuginfo=0",
   "-C", "strip=symbols",
   "--crate-type", "cdylib",
+  "-C", "link-arg=--export=__stack_pointer",
 ];
 
 async function build(out: string, extra: string[]) {
