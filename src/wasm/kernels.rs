@@ -49,13 +49,15 @@ pub unsafe extern "C" fn gemm(
     m: usize,
     k: usize,
     n: usize,
+    ldb: usize,
+    ldc: usize,
     a: *const f32,
     b: *const f32,
     c: *mut f32,
     bias: *const f32,
     act: u32,
 ) {
-    gemm_range(m, k, n, a, b, c, bias, act, 0, n);
+    gemm_range(m, k, n, ldb, ldc, a, b, c, bias, act, 0, n);
 }
 
 /// The same GEMM restricted to output columns [lo, hi). Column ranges are
@@ -75,7 +77,8 @@ unsafe fn tile8x8(
     mi: usize,
     j: usize,
     k: usize,
-    n: usize,
+    ldb: usize,
+    ldc: usize,
     a: *const f32,
     b: *const f32,
     c: *mut f32,
@@ -90,7 +93,7 @@ unsafe fn tile8x8(
         acc_hi[r] = f32x4_splat(v);
     }
     for kk in 0..k {
-        let brow = b.add(kk * n + j);
+        let brow = b.add(kk * ldb + j);
         let b0 = v128_load(brow as *const v128);
         let b1 = v128_load(brow.add(4) as *const v128);
         for r in 0..8 {
@@ -100,7 +103,7 @@ unsafe fn tile8x8(
         }
     }
     for r in 0..8 {
-        let cr = c.add((mi + r) * n + j);
+        let cr = c.add((mi + r) * ldc + j);
         v128_store(cr as *mut v128, apply(acc_lo[r], act));
         v128_store(cr.add(4) as *mut v128, apply(acc_hi[r], act));
     }
@@ -111,6 +114,8 @@ pub unsafe extern "C" fn gemm_range(
     m: usize,
     k: usize,
     n: usize,
+    ldb: usize,
+    ldc: usize,
     a: *const f32,
     b: *const f32,
     c: *mut f32,
@@ -133,7 +138,7 @@ pub unsafe extern "C" fn gemm_range(
     while mi < m8 {
         let mut j = lo;
         while j < j_end {
-            tile8x8(mi, j, k, n, a, b, c, bias, act);
+            tile8x8(mi, j, k, ldb, ldc, a, b, c, bias, act);
             j += 8;
         }
         mi += 8;
@@ -141,12 +146,12 @@ pub unsafe extern "C" fn gemm_range(
 
     // Columns past the last multiple of eight, for every row.
     if j_end < hi {
-        gemm_edge(m, k, n, a, b, c, bias, act, j_end, hi);
+        gemm_edge(m, k, ldb, ldc, a, b, c, bias, act, j_end, hi);
     }
     // Rows past the last multiple of eight, for the columns the block covered.
     if m8 < m && lo < j_end {
         let bias_tail = if bias.is_null() { bias } else { bias.add(m8) };
-        gemm_edge(m - m8, k, n, a.add(m8 * k), b, c.add(m8 * n), bias_tail, act, lo, j_end);
+        gemm_edge(m - m8, k, ldb, ldc, a.add(m8 * k), b, c.add(m8 * ldc), bias_tail, act, lo, j_end);
     }
 }
 
@@ -154,7 +159,8 @@ pub unsafe extern "C" fn gemm_range(
 unsafe fn gemm_edge(
     m: usize,
     k: usize,
-    n: usize,
+    ldb: usize,
+    ldc: usize,
     a: *const f32,
     b: *const f32,
     c: *mut f32,
@@ -166,12 +172,12 @@ unsafe fn gemm_edge(
     for mi in 0..m {
         let bv0 = if bias.is_null() { 0.0 } else { *bias.add(mi) };
         let ar = a.add(mi * k);
-        let cr = c.add(mi * n);
+        let cr = c.add(mi * ldc);
         let mut j = lo;
         while j + 4 <= hi {
             let mut acc = f32x4_splat(bv0);
             for kk in 0..k {
-                acc = fma(f32x4_splat(*ar.add(kk)), v128_load(b.add(kk * n + j) as *const v128), acc);
+                acc = fma(f32x4_splat(*ar.add(kk)), v128_load(b.add(kk * ldb + j) as *const v128), acc);
             }
             v128_store(cr.add(j) as *mut v128, apply(acc, act));
             j += 4;
@@ -179,7 +185,7 @@ unsafe fn gemm_edge(
         while j < hi {
             let mut s = bv0;
             for kk in 0..k {
-                s += *ar.add(kk) * *b.add(kk * n + j);
+                s += *ar.add(kk) * *b.add(kk * ldb + j);
             }
             *cr.add(j) = apply1(s, act);
             j += 1;
@@ -292,12 +298,17 @@ unsafe fn dw_scalar(
 }
 
 /// Lay out patches as [Cin*kh*kw, OH*OW] so a dense conv becomes one gemm.
+/// im2col for one run of output positions, writing a `(cin*kh*kw) x width`
+/// matrix instead of the whole `x (oh*ow)` one.
+///
+/// The full matrix is the problem: a 3x3 convolution over 240x240 with 64
+/// input channels expands a 14.7 MB tensor into 132 MB, and the GEMM then
+/// re-reads all of it once per row tile. Strips sized to stay in cache turn
+/// that back into a few megabytes of traffic.
 #[no_mangle]
-pub unsafe extern "C" fn im2col(
-    cin: usize,
+pub unsafe extern "C" fn im2col_strip(
     ih: usize,
     iw: usize,
-    oh: usize,
     ow: usize,
     kh: usize,
     kw: usize,
@@ -307,35 +318,44 @@ pub unsafe extern "C" fn im2col(
     pl: usize,
     dy: usize,
     dx: usize,
+    p0: usize,
+    width: usize,
     x: *const f32,
     col: *mut f32,
     c_lo: usize,
     c_hi: usize,
 ) {
-    let _ = cin;
-    let plane = oh * ow;
     for c in c_lo..c_hi {
+        let src = x.add(c * ih * iw);
         for ky in 0..kh {
             for kx in 0..kw {
-                let dst = col.add(((c * kh + ky) * kw + kx) * plane);
-                let src = x.add(c * ih * iw);
-                for oy in 0..oh {
+                let dst = col.add(((c * kh + ky) * kw + kx) * width);
+                let mut t = 0;
+                // Walk the strip one output row at a time so the divide that
+                // turns a flat position into (oy, ox) happens once per row,
+                // not once per element.
+                while t < width {
+                    let p = p0 + t;
+                    let oy = p / ow;
+                    let ox = p % ow;
+                    let run = if width - t < ow - ox { width - t } else { ow - ox };
                     let iy = (oy * sy) as isize - pt as isize + (ky * dy) as isize;
                     if iy < 0 || iy >= ih as isize {
-                        for ox in 0..ow {
-                            *dst.add(oy * ow + ox) = 0.0;
+                        for u in 0..run {
+                            *dst.add(t + u) = 0.0;
                         }
-                        continue;
+                    } else {
+                        let row = src.add(iy as usize * iw);
+                        for u in 0..run {
+                            let ix = ((ox + u) * sx) as isize - pl as isize + (kx * dx) as isize;
+                            *dst.add(t + u) = if ix < 0 || ix >= iw as isize {
+                                0.0
+                            } else {
+                                *row.add(ix as usize)
+                            };
+                        }
                     }
-                    let row = src.add(iy as usize * iw);
-                    for ox in 0..ow {
-                        let ix = (ox * sx) as isize - pl as isize + (kx * dx) as isize;
-                        *dst.add(oy * ow + ox) = if ix < 0 || ix >= iw as isize {
-                            0.0
-                        } else {
-                            *row.add(ix as usize)
-                        };
-                    }
+                    t += run;
                 }
             }
         }

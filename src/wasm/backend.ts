@@ -30,6 +30,25 @@ export type Kernels = {
     cLo: number,
     cHi: number,
   ): void;
+  im2col_strip(
+    ih: number,
+    iw: number,
+    ow: number,
+    kh: number,
+    kw: number,
+    sy: number,
+    sx: number,
+    pt: number,
+    pl: number,
+    dy: number,
+    dx: number,
+    p0: number,
+    width: number,
+    x: number,
+    col: number,
+    cLo: number,
+    cHi: number,
+  ): void;
   softmax_rows(cols: number, a: number, out: number, rLo: number, rHi: number): void;
   transpose4(
     d0: number,
@@ -61,6 +80,8 @@ export type Kernels = {
     m: number,
     k: number,
     n: number,
+    ldb: number,
+    ldc: number,
     a: number,
     b: number,
     c: number,
@@ -86,25 +107,6 @@ export type Kernels = {
     act: number,
     chLo: number,
     chHi: number,
-  ): void;
-  im2col(
-    cin: number,
-    ih: number,
-    iw: number,
-    oh: number,
-    ow: number,
-    kh: number,
-    kw: number,
-    sy: number,
-    sx: number,
-    pt: number,
-    pl: number,
-    dy: number,
-    dx: number,
-    x: number,
-    col: number,
-    cLo: number,
-    cHi: number,
   ): void;
 };
 
@@ -153,12 +155,30 @@ export class Arena {
   // Each falls back to the single-threaded kernel when there is no pool or
   // the tensor is too small for the dispatch to pay for itself.
 
-  pGemm(m: number, k: number, n: number, a: number, b: number, c: number, bias: number, act: number) {
+  /** `ldb` and `ldc` default to `n`; a strip passes its own B width and the full C width. */
+  pGemm(
+    m: number,
+    k: number,
+    n: number,
+    a: number,
+    b: number,
+    c: number,
+    bias: number,
+    act: number,
+    ldb = n,
+    ldc = n,
+  ) {
     if (this.pool && m * n >= PARALLEL_MIN) {
-      this.pool.dispatch(JOB.gemm, [m, k, n, a, b, c, bias, act]);
+      this.pool.dispatch(JOB.gemm, [m, k, n, ldb, ldc, a, b, c, bias, act]);
     } else {
-      this.k.gemm(m, k, n, a, b, c, bias, act);
+      this.k.gemm(m, k, n, ldb, ldc, a, b, c, bias, act);
     }
+  }
+
+  pIm2colStrip(args: number[]) {
+    const cin = args[0];
+    if (this.pool && cin * args[13] >= PARALLEL_MIN) this.pool.dispatch(JOB.im2colStrip, args);
+    else (this.k.im2col_strip as (...a: number[]) => void)(...args.slice(1), 0, cin);
   }
 
   pDepthwise(args: number[]) {
@@ -166,12 +186,6 @@ export class Arena {
     const outElems = channels * args[3] * args[4];
     if (this.pool && outElems >= PARALLEL_MIN) this.pool.dispatch(JOB.depthwise, args);
     else (this.k.depthwise as (...a: number[]) => void)(...args, 0, channels);
-  }
-
-  pIm2col(args: number[]) {
-    const cin = args[0];
-    if (this.pool && cin * args[3] * args[4] >= PARALLEL_MIN) this.pool.dispatch(JOB.im2col, args);
-    else (this.k.im2col as (...a: number[]) => void)(...args, 0, cin);
   }
 
   pUnary(op: number, n: number, a: number, out: number, p0: number, p1: number) {

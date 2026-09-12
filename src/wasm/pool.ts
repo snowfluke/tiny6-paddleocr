@@ -9,12 +9,12 @@
 export const JOB = {
   gemm: 1,
   depthwise: 2,
-  im2col: 3,
   unary: 4,
   binary: 5,
   scatter2x2: 6,
   softmax: 7,
   affine: 8,
+  im2colStrip: 9,
 } as const;
 
 /** Int32 slots in the control block: 0 sequence, 1 completions, 2 op, 3+ args. */
@@ -53,14 +53,14 @@ function runShare(k, c, index, count) {
   const a = 3;
   if (op === ${JOB.gemm}) {
     const [lo, hi] = shareBy8(c[a + 2], index, count);
-    if (lo < hi) k.gemm_range(c[a], c[a + 1], c[a + 2], c[a + 3], c[a + 4], c[a + 5], c[a + 6], c[a + 7], lo, hi);
+    if (lo < hi) k.gemm_range(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], lo, hi);
   } else if (op === ${JOB.depthwise}) {
     const [lo, hi] = share(c[a], index, count);
     if (lo < hi) k.depthwise(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], lo, hi);
-  } else if (op === ${JOB.im2col}) {
+  } else if (op === ${JOB.im2colStrip}) {
     const [lo, hi] = share(c[a], index, count);
-    if (lo < hi) k.im2col(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], lo, hi);
-  } else if (op === ${JOB.unary}) {
+    if (lo < hi) k.im2col_strip(c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], lo, hi);
+    } else if (op === ${JOB.unary}) {
     const [lo, hi] = share(c[a + 1], index, count);
     if (lo < hi) k.unary(c[a], hi - lo, c[a + 2] + lo * 4, c[a + 3] + lo * 4, f[a + 4], f[a + 5]);
   } else if (op === ${JOB.binary}) {

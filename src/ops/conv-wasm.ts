@@ -2,6 +2,13 @@ import type { RT, Resident } from "../runtime/resident.ts";
 import type { ConvAttrs } from "./nn.ts";
 
 /**
+ * How large one im2col strip may get. Four megabytes sits inside the shared L2
+ * on this machine, so the GEMM's repeated passes over the strip never reach
+ * memory. Bigger wastes cache; smaller multiplies the dispatch count.
+ */
+const STRIP_BYTES = 1 << 22;
+
+/**
  * Conv through the WASM kernels. Three paths, picked by shape:
  *   depthwise      group == Cout, one filter per channel
  *   1x1 dense      the input is already the GEMM operand, no im2col
@@ -31,8 +38,18 @@ export function convResident(
 
   const pointwise = kh === 1 && kw === 1 && sy === 1 && sx === 1 && !pt && !pl && !pb && !pr;
   const K = Cin * kh * kw;
-  // One scratch buffer serves the whole batch; im2col rewrites it per item.
-  const col = !pointwise && a.group === 1 ? r.alloc([K, OH * OW]) : null;
+  const plane = OH * OW;
+
+  // The column matrix is built a strip at a time, sized to stay in cache. The
+  // GEMM re-reads all of B once per eight output channels, so a full-width
+  // matrix is read many times over: a 3x3 convolution at 960x960 expands a
+  // 14.7 MB input into 132 MB and the GEMM then moved about a gigabyte.
+  const needsCol = !pointwise && a.group === 1;
+  const strip = needsCol
+    ? Math.max(8, Math.min(plane, Math.floor(STRIP_BYTES / (K * 4)) & ~7))
+    : 0;
+  // One scratch buffer serves the whole batch; each strip rewrites it.
+  const col = needsCol ? r.alloc([K, strip]) : null;
 
   // Batch items are independent, so each one runs the same kernel at its own
   // offset. Batching exists to amortise the per-node dispatch, not to widen
@@ -45,8 +62,12 @@ export function convResident(
     } else if (pointwise) {
       r.ar.pGemm(Cout, Cin, OH * OW, w.ptr, xi, yi, bPtr, act);
     } else {
-      r.ar.pIm2col([Cin, H, W, OH, OW, kh, kw, sy, sx, pt, pl, dy, dx, xi, col!.ptr]);
-      r.ar.pGemm(Cout, K, OH * OW, w.ptr, col!.ptr, yi, bPtr, act);
+      for (let p0 = 0; p0 < plane; p0 += strip) {
+        const width = Math.min(strip, plane - p0);
+        r.ar.pIm2colStrip([Cin, H, W, OW, kh, kw, sy, sx, pt, pl, dy, dx, p0, width, xi, col!.ptr]);
+        // B is this strip, `width` wide; C is the full output row, `plane` wide.
+        r.ar.pGemm(Cout, K, width, w.ptr, col!.ptr, yi + p0 * 4, bPtr, act, width, plane);
+      }
     }
   }
   if (col) r.ar.release(col.ptr);
