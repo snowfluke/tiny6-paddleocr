@@ -19,6 +19,23 @@ export function canUseThreads(): boolean {
     (typeof crossOriginIsolated === "undefined" || crossOriginIsolated);
 }
 
+/**
+ * One function taking three v128s and returning f32x4.relaxed_madd of them.
+ * The kernels are built with relaxed SIMD, so an engine that cannot validate
+ * this cannot run them: Chrome 114, Safari 18 and Node 20 are the floors.
+ */
+const RELAXED_SIMD_PROBE = Uint8Array.from([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+  0x01, 0x08, 0x01, 0x60, 0x03, 0x7b, 0x7b, 0x7b, 0x01, 0x7b,
+  0x03, 0x02, 0x01, 0x00,
+  0x0a, 0x0d, 0x01, 0x0b, 0x00, 0x20, 0x00, 0x20, 0x01, 0x20, 0x02, 0xfd, 0x85, 0x02, 0x0b,
+]);
+
+/** False on a browser too old for the kernels. Check before createOcr. */
+export function canRunKernels(): boolean {
+  return typeof WebAssembly !== "undefined" && WebAssembly.validate(RELAXED_SIMD_PROBE);
+}
+
 function base64ToBytes(b64: string): Uint8Array {
   const bin = atob(b64);
   const out = new Uint8Array(bin.length);
@@ -53,6 +70,11 @@ export async function createOcr(
   assets: WebAssets,
   onProgress?: (what: string) => void,
 ): Promise<Ocr> {
+  if (!canRunKernels()) {
+    throw new Error(
+      "this browser lacks WebAssembly relaxed SIMD; needs Chrome 114+, Safari 18+ or Node 20+",
+    );
+  }
   const fetchBytes = async (url: string) => {
     onProgress?.(url.split("/").pop() ?? url);
     const r = await fetch(url);
