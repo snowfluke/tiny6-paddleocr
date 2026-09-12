@@ -27,12 +27,15 @@ engines hold cores and whichever ran second would look slow.
 
 | model | input | 1 thread | 4 threads | ORT | vs ORT |
 |---|---|---|---|---|---|
-| det | 1x3x960x960 | 302 ms | **121 ms** | 55 ms | 2.2x |
-| det | 1x3x256x256 | 25 ms | **12 ms** | 4 ms | 3.1x |
-| rec | 1x3x48x320 | 20 ms | **14 ms** | 3 ms | 4.7x |
+| det | 1x3x960x960 | 298 ms | **118 ms** | 55 ms | 2.1x |
+| det | 1x3x256x256 | 24 ms | **12 ms** | 4 ms | 2.9x |
+| rec | 1x3x48x320 | 14 ms | **7 ms** | 3 ms | 2.3x |
 
-End to end on a 720x1280 receipt: detection ~140 ms, recognition ~245 ms for
-28 crops across four workers, **~385 ms total**.
+End to end on a 720x1280 receipt: detection ~160 ms, recognition ~185 ms for
+28 crops across four workers, **~345 ms total**.
+
+Ratios are measured interleaved against the previous build, alternating which
+runs first, because the machine's other load moves absolute numbers by 20%.
 
 Four threads is the default because this machine has four performance cores.
 Measured at 960x960: 2 threads 180 ms, 4 threads 121 ms, 5 threads 140 ms,
@@ -48,7 +51,14 @@ Detection at 960x960, as the work landed:
 | activations resident in WASM memory | 445 |
 | worker pool | 214 |
 | 8x8 GEMM micro-kernel | 144 |
-| gelu fused, concat and transposed conv kept in wasm | **121** |
+| gelu fused, concat and transposed conv kept in wasm | **118** |
+
+Recognition, 1x3x48x320 on four threads:
+
+| | ms |
+|---|---|
+| before this work | 16.5 |
+| eleven ops no longer falling back to JavaScript | **8.2** |
 
 ## Accuracy
 
@@ -98,6 +108,12 @@ PNG/JPEG -> RGBA -> resize to 32-grid -> normalize -> det graph
 ```
 
 - `src/onnx/` parses the ONNX protobuf directly. No generated code.
+- `src/runtime/fuse.ts` rewrites the graph before it runs. paddle2onnx exports
+  gelu as five nodes and gives the recognition model no convolution bias at
+  all, emitting a separate Add for each one. Folding those, plus Relu, takes
+  detection from 242 nodes to 171 and recognition from 219 to 146. These are
+  the same rewrites onnxruntime calls Gelu Fusion, Conv Add Fusion and Conv
+  Activation Fusion.
 - `src/runtime/graph.ts` executes the 22 ops the two models use. It has two
   paths: pure TypeScript, which stays as the reference, and a resident path
   where every activation is a pointer into WASM memory and nothing crosses the
@@ -112,6 +128,22 @@ PNG/JPEG -> RGBA -> resize to 32-grid -> normalize -> det graph
 - `src/pipeline/components.ts` replaces `cv.findContours` with union-find
   connected components; `boxes.ts` replaces `cv.minAreaRect` with a convex
   hull and rotating calipers.
+
+### Falling back to JavaScript is the expensive mistake
+
+An op with no resident kernel downloads its inputs out of wasm memory, runs in
+TypeScript and uploads the result. That cost more than every other
+inefficiency in the recognition model put together: eleven nodes per run took
+that path and they were a third of its time.
+
+| | before | after |
+|---|---|---|
+| Add | 454 us/node | 11 us |
+| Softmax | 1615 us | 624 us |
+| rec, 4 threads | 16.5 ms | **8.2 ms** |
+
+Only AveragePool still falls back. The lesson generalises: measure what leaves
+wasm memory before tuning what happens inside it.
 
 ### Two kinds of parallelism
 
@@ -252,6 +284,8 @@ sequence number after reporting ready and so slept through the first job.
   runs recognition serially: `src/browser.ts` has no `makeRecWorker`, which
   needs `rec-worker.ts` bundled into a second inlined blob. Node and Bun get
   both pools.
+- **AveragePool.** The one op still without a resident kernel, 451 us a run in
+  recognition.
 - **The other models.** Only v6 tiny. Other exports may use ops not
   implemented here; the runtime throws by name if so.
 - **Arithmetic-coded and 12-bit JPEG**, which nothing produces in practice.
