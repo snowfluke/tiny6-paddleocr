@@ -54,6 +54,17 @@ export function isSeparator(text: string): boolean {
   return t.length > 0 && !/[\p{L}\p{N}]/u.test(t) && /^[-_=+~*.:|/\\<>^'"`,;!?()[\]{}]+$/u.test(t);
 }
 
+/**
+ * Six on an eight-core big.LITTLE machine, measured on the receipt: four
+ * workers 93 ms, six 83 ms, eight 85 ms. Recognition is task-parallel with no
+ * barrier, so an efficiency core can help here where it cannot in the
+ * detection pool. Each worker holds its own copy of the weights, 4.3 MB.
+ */
+export function defaultRecWorkers(): number {
+  const n = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 4) : 4;
+  return Math.max(1, Math.min(6, n));
+}
+
 export class Ocr {
   private constructor(
     private readonly det: Session,
@@ -82,7 +93,7 @@ export class Ocr {
       ? await loadKernelsThreaded(a.wasmShared, threads)
       : await loadKernels(a.wasm);
 
-    const recCount = a.recWorkers ?? (a.threads ?? defaultThreads());
+    const recCount = a.recWorkers ?? defaultRecWorkers();
     const recPool = a.makeRecWorker && recCount > 1
       ? await RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict }, recCount)
       : null;
