@@ -62,53 +62,29 @@ export function convTranspose2x2Resident(r: Resident, x: RT, w: RT, b: RT | null
   const [, Cin, H, W] = x.dims;
   const Cout = w.dims[1];
   const HW = H * W;
-  const OH = H * 2;
-  const OW = W * 2;
 
   // Weights arrive as [Cin, Cout, 2, 2]; GEMM wants [Cout, Cin] per tap. The
   // regrouped copies live in scratch and are rebuilt per call, which is
   // nothing next to the GEMMs and keeps them out of the sealed weight region.
   const wData = new Float32Array(w.len);
   r.ar.readInto(w.ptr, wData);
-  const out = r.alloc([1, Cout, OH, OW]);
-  const outData = new Float32Array(out.len);
+  const out = r.alloc([1, Cout, H * 2, W * 2]);
   const tapBuf = new Float32Array(Cout * Cin);
   const tapRT = r.alloc([Cout, Cin]);
   const acc = r.alloc([Cout, HW]);
-  const accData = new Float32Array(Cout * HW);
 
+  // The four taps write disjoint pixels of the output, so each one's GEMM can
+  // carry the bias and nothing has to be accumulated afterwards.
   for (let t = 0; t < 4; t++) {
     for (let ic = 0; ic < Cin; ic++) {
       for (let oc = 0; oc < Cout; oc++) tapBuf[oc * Cin + ic] = wData[(ic * Cout + oc) * 4 + t];
     }
     r.ar.write(tapRT.ptr, tapBuf);
-    r.ar.pGemm(Cout, Cin, HW, tapRT.ptr, x.ptr, acc.ptr, 0, 0);
-    r.ar.readInto(acc.ptr, accData);
-
-    const ky = t >> 1;
-    const kx = t & 1;
-    for (let oc = 0; oc < Cout; oc++) {
-      const src = oc * HW;
-      const dst = oc * OH * OW;
-      for (let y = 0; y < H; y++) {
-        const row = dst + (y * 2 + ky) * OW + kx;
-        const srow = src + y * W;
-        for (let xi = 0; xi < W; xi++) outData[row + xi * 2] = accData[srow + xi];
-      }
-    }
+    r.ar.pGemm(Cout, Cin, HW, tapRT.ptr, x.ptr, acc.ptr, b ? b.ptr : 0, 0);
+    r.ar.pScatter2x2(Cout, H, W, t >> 1, t & 1, acc.ptr, out.ptr);
   }
   r.ar.release(tapRT.ptr);
   r.ar.release(acc.ptr);
-
-  if (b) {
-    const bias = new Float32Array(b.len);
-    r.ar.readInto(b.ptr, bias);
-    for (let oc = 0; oc < Cout; oc++) {
-      const base = oc * OH * OW;
-      for (let i = 0; i < OH * OW; i++) outData[base + i] += bias[oc];
-    }
-  }
-  r.ar.write(out.ptr, outData);
   return out;
 }
 

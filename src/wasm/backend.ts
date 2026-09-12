@@ -19,6 +19,16 @@ export type Kernels = {
   unary(op: number, n: number, a: number, out: number, p0: number, p1: number): void;
   reduce_mean(outer: number, inner: number, a: number, out: number): void;
   maxpool2x2(planes: number, h: number, w: number, a: number, out: number, lo: number, hi: number): void;
+  scatter2x2(
+    h: number,
+    w: number,
+    ky: number,
+    kx: number,
+    src: number,
+    dst: number,
+    pLo: number,
+    pHi: number,
+  ): void;
   resize_nearest(
     planes: number, h: number, w: number, sh: number, sw: number,
     a: number, out: number, lo: number, hi: number,
@@ -151,6 +161,14 @@ export class Arena {
   pBinarySame(op: number, n: number, a: number, b: number, out: number) {
     if (this.pool && n >= PARALLEL_MIN) this.pool.dispatch(JOB.binary, [op, 0, n, a, b, out]);
     else this.k.binary(op, 0, n, 0, 0, a, b, out);
+  }
+
+  pScatter2x2(planes: number, h: number, w: number, ky: number, kx: number, src: number, dst: number) {
+    if (this.pool && planes * h * w >= PARALLEL_MIN) {
+      this.pool.dispatch(JOB.scatter2x2, [planes, h, w, ky, kx, src, dst]);
+    } else {
+      this.k.scatter2x2(h, w, ky, kx, src, dst, 0, planes);
+    }
   }
 
   seal() {

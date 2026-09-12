@@ -581,6 +581,35 @@ fn fmaxf(a: f32, b: f32) -> f32 {
 }
 
 /// Nearest-neighbour upsample by integer factors on the last two axes.
+/// Writes one 2x2 tap of a stride-2 transposed convolution into the upsampled
+/// plane: dst[p][2y + ky][2x + kx] = src[p][y][x]. The four taps land on
+/// disjoint pixels, so nothing accumulates and each tap's GEMM can carry the
+/// bias itself.
+#[no_mangle]
+pub unsafe extern "C" fn scatter2x2(
+    h: usize,
+    w: usize,
+    ky: usize,
+    kx: usize,
+    src: *const f32,
+    dst: *mut f32,
+    p_lo: usize,
+    p_hi: usize,
+) {
+    let ow = w * 2;
+    for p in p_lo..p_hi {
+        let sp = src.add(p * h * w);
+        let dp = dst.add(p * h * 2 * ow);
+        for y in 0..h {
+            let srow = sp.add(y * w);
+            let drow = dp.add((y * 2 + ky) * ow + kx);
+            for x in 0..w {
+                *drow.add(x * 2) = *srow.add(x);
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn resize_nearest(
     planes: usize,
