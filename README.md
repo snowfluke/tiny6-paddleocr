@@ -9,12 +9,15 @@ Proof of concept. Runs on Node/Bun and in the browser.
 
 | part | size |
 |---|---|
-| runtime, browser bundle | **90 KB** (26.7 KB gzipped) |
-| of which WASM kernels | 17,544 bytes, twice (plain + shared memory) |
+| runtime, browser bundle | **126 KB** (48 KB gzipped) |
+| of which WASM kernels | 28,589 bytes, twice (plain + shared memory) |
 | detection model | 1.70 MB |
 | recognition model | 4.26 MB |
 | dictionary (6,906 entries) | 0.03 MB |
-| **total** | **6.02 MB** on the wire, 6.08 MB unpacked |
+| **total** | **6.12 MB** on the wire, 6.18 MB unpacked |
+
+Peak wasm memory for detection at 960x960 is 168 MB. It was 422 MB before the
+im2col matrix was built a strip at a time; a heap that size fails on a phone.
 
 For comparison, `onnxruntime-web`'s smallest WASM binary is 14 MB and
 `onnxruntime-node` unpacks to 85 MB per platform. OpenCV.js adds 15 MB.
@@ -31,23 +34,30 @@ onnxruntime-node is native ARM64 and does not.
 
 | model | input | ours 1t | ours 4t | ort-web 1t | ort-web 4t | ort native |
 |---|---|---|---|---|---|---|
-| det | 1x3x960x960 | 300 ms | **118 ms** | 246 ms | 81 ms | 55 ms |
-| rec | 1x3x48x320 | 14 ms | **7.6 ms** | 11.8 ms | 3.6 ms | 3 ms |
+| det | 1x3x960x960 | 272 ms | **96 ms** | 246 ms | 76 ms | 55 ms |
+| rec | 1x3x48x320 | 13.3 ms | **7.2 ms** | 11.8 ms | 3.6 ms | 3 ms |
 
-Against onnxruntime-web the gap is 1.2x on one thread and 1.5x on four. Most
-of what is left is thread scaling, not the kernel: ort-web gets 3.0x from four
-threads on detection where we get 2.5x.
+Against onnxruntime-web the gap is 1.1x on one thread and 1.3x on four for
+detection. ort-web scales 3.3x on four threads where we get 2.8x; the
+difference is not the split (see Threads), it is that every thread here slows
+by about a quarter once all cores are loaded, and ort-web's kernels move fewer
+bytes per flop.
 
-End to end on a 720x1280 receipt, both warm, minimum of six, run back to back:
+End to end on a 720x1280 receipt, both warm, minimum of six, measured in the
+same minute:
 
-| | ms |
-|---|---|
-| ppu-paddle-ocr (onnxruntime-node + OpenCV) | **151** |
-| tiny6-paddleocr (this, detect 92 + recognize 111) | 204 |
+| | idle machine | loaded machine |
+|---|---|---|
+| ppu-paddle-ocr (onnxruntime-node + OpenCV) | **110** | 151 |
+| tiny6-paddleocr (this) | 148 (detect 66 + recognize 80) | **149** |
 
-On an idle machine both improve and the reference improves more, to 112
-against our 196, because it uses every core where we cap at four plus four
-recognition workers.
+Under load it is a tie. Idle, the native reference wins by 1.35x, and the
+arithmetic says it keeps winning: native ORT does 18.7 us per recognition
+column against our 42, and its detection graph runs in 29 ms against our 56.
+With detection at ort-web parity and recognition at its six-worker floor the
+pipeline lands near 115 ms. Beating native from WebAssembly on this machine
+is not on the table; beating onnxruntime-web is the fight that can be won,
+and it is 1.3x away.
 
 Absolute numbers on a developer machine are not worth much: the same build
 measured 116 ms and 193 ms for the same work depending on what else was
@@ -55,10 +65,12 @@ running. `bun run ab <rev> <model> <dims> <threads>` exports that revision,
 builds it, and alternates which side runs first each round, reporting the
 minimum of each. Every ratio quoted here comes from that.
 
-Four threads is the default because this machine has four performance cores.
-Measured at 960x960: 2 threads 180 ms, 4 threads 121 ms, 5 threads 140 ms,
-6 threads 131 ms, 8 threads 129 ms. Every job ends at a barrier, so a share
-that lands on an efficiency core holds up the other three.
+Four detection threads is the default because this machine has four
+performance cores. Measured at 960x960: 2 threads 180 ms, 4 threads 121 ms, 5
+threads 140 ms, 6 threads 131 ms, 8 threads 129 ms. Every job ends at a
+barrier, so a share that lands on an efficiency core holds up the other three.
+Recognition workers default to six, because task-parallel work has no barrier:
+on the receipt four workers recognise in 93 ms, six in 83, eight in 85.
 
 Detection at 960x960, as the work landed:
 
@@ -69,14 +81,22 @@ Detection at 960x960, as the work landed:
 | activations resident in WASM memory | 445 |
 | worker pool | 214 |
 | 8x8 GEMM micro-kernel | 144 |
-| gelu fused, concat and transposed conv kept in wasm | **118** |
+| gelu fused, concat and transposed conv kept in wasm | 118 |
+| im2col in strips, one job per strip, depthwise specialised | **96** |
 
-Recognition, 1x3x48x320 on four threads:
+Recognition on the receipt, 28 crops, wall:
 
 | | ms |
 |---|---|
-| before this work | 16.5 |
-| eleven ops no longer falling back to JavaScript | **8.2** |
+| four workers, reading order | 101 |
+| eleven ops no longer falling back to JavaScript | 100 |
+| crop widths padded to eight, widest first | 93 |
+| six workers | 83 |
+| depthwise specialised | **80** |
+
+A crop costs about 1.0 ms plus 42 us per pixel of width on one thread. The
+28 crops sum to ~320 ms of compute, and six workers finish in 80 with every
+worker busy within 2-6 ms of the wall. There is nothing left in scheduling.
 
 ## Accuracy
 
@@ -184,9 +204,12 @@ linear memory: each share writes a disjoint slice, so a job is one sequence
 bump plus a barrier, no locks. That suits detection.
 
 A recognition crop is too small for a split to pay while the graph still
-dispatches 219 jobs, so `src/pipeline/rec-pool.ts` gives each worker a
-complete rec Session and hands it whole crops instead: 3.6x on a 28-crop
-receipt. The cost is one copy of the weights per worker, about 4.3 MB.
+dispatches 146 jobs, so `src/pipeline/rec-pool.ts` gives each worker a
+complete rec Session and hands it whole crops instead, widest first. The cost
+is one copy of the weights per worker, about 4.3 MB. An odd crop width makes
+every downstream column count ragged and the GEMM's ragged tail is scalar, 16
+to 17 px measured 2.0 to 2.9 ms, so widths pad up to a multiple of eight with
+mid-grey, which is what PaddleOCR trains with.
 
 ### The GEMM
 
@@ -240,6 +263,14 @@ The default is half the reported cores capped at four. Every job ends at a
 barrier, so on a big.LITTLE machine a share landing on an efficiency core
 holds up the rest: four threads ran 164 ms where eight ran 180 ms.
 
+Instrumenting every dispatch at four threads showed the main thread, which
+runs share 0 and every serial op between kernels, finishing last on 99% of
+GEMMs with workers idle about 35 ms a run. Scaling its share down did not
+help: 1.0x a worker's share 121 ms, 0.5x 122, 0 136. Three workers doing all
+the work took 40% longer per unit than one thread alone does. The loss is not
+the split; every thread slows once four run. Column blocking of the GEMM was
+neutral for the same reason, each thread's slice of B already fits L2.
+
 `rust-lld` will not emit a shared memory, because the precompiled `libcore`
 for this target was not built with the atomics feature and rebuilding it needs
 nightly. The kernels do not want atomic instructions anyway, only the memory's
@@ -285,13 +316,23 @@ sequence number after reporting ready and so slept through the first job.
   locality costs more than the per-run overhead it saves. `recognizeBatch` is
   kept, correct and tested, but is not the default.
 - **Packing the GEMM's B operand.** 0.99-1.05x. Removed.
+- **Column blocking the GEMM.** Neutral at four threads from 128 columns to
+  none, 107.3-108.0 ms. Each thread's slice of B already fits L2.
+- **Spinning before parking a worker.** Detection 28% slower: a quarter of
+  the graph is serial and three spinning workers steal cores from the thread
+  doing it. Separating the sequence and completion counters onto different
+  cache lines only mattered while spinning; also reverted.
+- **Weighting the main thread's share.** See Threads. 1.0x was best.
+- **Crop width alignment above eight.** 16 and 32 measured no faster end to
+  end; the wall is set by the widest crops, which lose only 8% to raggedness.
 - **Relaxed SIMD.** `f32x4.relaxed_madd` is in the kernels and is worth 15% on
   3x3 im2col and nothing on the 1x1 shapes. It needs Chrome 114, Safari 18 or
   Node 20; there is no fallback build.
 - **`v128.load32_splat` for the GEMM's A operand.** One instruction instead of
   a scalar load plus a splat, and 0.90x measured. JavaScriptCore lowers it
   worse than the pair.
-- **More than four threads.** Slower on big.LITTLE. See above.
+- **More than four detection threads.** Slower on big.LITTLE. See above.
+  Recognition workers are the exception: six beat four, eight did not beat six.
 
 ## Not done
 
@@ -305,6 +346,9 @@ sequence number after reporting ready and so slept through the first job.
   both pools.
 - **AveragePool.** The one op still without a resident kernel, 451 us a run in
   recognition.
+- **The 5x5 depthwise still spills.** 25 taps plus ten accumulator chains do
+  not fit the register file; it runs at 3.4 GB/s where 3x3 runs at 9. Reloading
+  five taps per kernel row would fit. About 1 ms at four threads.
 - **The other models.** Only v6 tiny. Other exports may use ops not
   implemented here; the runtime throws by name if so.
 - **Arithmetic-coded and 12-bit JPEG**, which nothing produces in practice.
