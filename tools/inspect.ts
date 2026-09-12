@@ -1,0 +1,14 @@
+import { parseOnnx } from "../src/onnx/parse.ts";
+const g = parseOnnx(new Uint8Array(await Bun.file(process.argv[2]).arrayBuffer()));
+console.log("inputs :", g.inputs.map((i) => `${i.name}[${i.dims.join(",")}]`).join(" "));
+console.log("outputs:", g.outputs.map((o) => `${o.name}[${o.dims.join(",")}]`).join(" "));
+console.log("nodes  :", g.nodes.length, " initializers:", g.initializers.size);
+const ops = new Map<string, number>();
+for (const n of g.nodes) ops.set(n.opType, (ops.get(n.opType) ?? 0) + 1);
+console.log("ops    :", [...ops].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}:${v}`).join(" "));
+const attrs = new Set<string>();
+for (const n of g.nodes) for (const k of n.attrs.keys()) attrs.add(`${n.opType}.${k}`);
+console.log("attrs  :", [...attrs].sort().join(" "));
+let params = 0;
+for (const t of g.initializers.values()) params += t.dims.reduce((a, b) => a * b, 1);
+console.log("params :", (params / 1e6).toFixed(2), "M");
