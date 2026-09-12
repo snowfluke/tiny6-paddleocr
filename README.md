@@ -25,17 +25,35 @@ darwin arm64. ORT uses every core; the "4 threads" column is ours with the
 worker pool on. Each figure is measured in its own process, because both
 engines hold cores and whichever ran second would look slow.
 
-| model | input | 1 thread | 4 threads | ORT | vs ORT |
-|---|---|---|---|---|---|
-| det | 1x3x960x960 | 298 ms | **118 ms** | 55 ms | 2.1x |
-| det | 1x3x256x256 | 24 ms | **12 ms** | 4 ms | 2.9x |
-| rec | 1x3x48x320 | 14 ms | **7 ms** | 3 ms | 2.3x |
+There are two different comparisons and they give very different answers.
+onnxruntime-web is WebAssembly like us and hits the same engine ceiling;
+onnxruntime-node is native ARM64 and does not.
 
-End to end on a 720x1280 receipt: detection ~160 ms, recognition ~185 ms for
-28 crops across four workers, **~345 ms total**.
+| model | input | ours 1t | ours 4t | ort-web 1t | ort-web 4t | ort native |
+|---|---|---|---|---|---|---|
+| det | 1x3x960x960 | 300 ms | **118 ms** | 246 ms | 81 ms | 55 ms |
+| rec | 1x3x48x320 | 14 ms | **7.6 ms** | 11.8 ms | 3.6 ms | 3 ms |
 
-Ratios are measured interleaved against the previous build, alternating which
-runs first, because the machine's other load moves absolute numbers by 20%.
+Against onnxruntime-web the gap is 1.2x on one thread and 1.5x on four. Most
+of what is left is thread scaling, not the kernel: ort-web gets 3.0x from four
+threads on detection where we get 2.5x.
+
+End to end on a 720x1280 receipt, both warm, minimum of six, run back to back:
+
+| | ms |
+|---|---|
+| ppu-paddle-ocr (onnxruntime-node + OpenCV) | **151** |
+| tiny6-paddleocr (this, detect 92 + recognize 111) | 204 |
+
+On an idle machine both improve and the reference improves more, to 112
+against our 196, because it uses every core where we cap at four plus four
+recognition workers.
+
+Absolute numbers on a developer machine are not worth much: the same build
+measured 116 ms and 193 ms for the same work depending on what else was
+running. `bun run ab <rev> <model> <dims> <threads>` exports that revision,
+builds it, and alternates which side runs first each round, reporting the
+minimum of each. Every ratio quoted here comes from that.
 
 Four threads is the default because this machine has four performance cores.
 Measured at 960x960: 2 threads 180 ms, 4 threads 121 ms, 5 threads 140 ms,
@@ -85,6 +103,7 @@ bun run ocr test/images/receipt.jpg
 bun run ocr test/images/tilted.png --rotated
 bun run bench
 bun run bench:gemm
+bun run ab HEAD models/det.onnx 1x3x960x960 4   # interleaved A/B vs a revision
 bun run demo           # copies models into demo/, serves http://localhost:8099
 ```
 
