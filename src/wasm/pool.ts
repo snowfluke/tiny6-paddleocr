@@ -24,6 +24,10 @@ const SEQ = 0;
 const DONE = 1;
 const OP = 2;
 const ARG0 = 3;
+/** Next unclaimed block of the current job. Reset by the dispatcher per job. */
+const CLAIM = CTRL_SLOTS - 1;
+/** Blocks per thread. A late or slow thread then costs its own blocks, not the barrier. */
+const BLOCKS_PER_THREAD = 4;
 
 /**
  * Runs one share of the current job. Shared verbatim by the workers and the
@@ -48,9 +52,29 @@ function shareBy8(total, index, count) {
   const lo = Math.min(total, index * per);
   return [lo, Math.min(total, lo + per)];
 }
+// The job's range is cut into BLOCKS_PER_THREAD * count blocks and every
+// thread, the main one included, claims the next block with one atomic add
+// until none are left. Static shares were measured first: a thread that
+// finishes late holds the barrier for its whole share, and with four threads
+// one always finished late.
 function runShare(k, c, index, count) {
   const op = c[2];
   const a = 3;
+  const total = op === ${JOB.gemm} ? c[a + 2]
+    : op === ${JOB.unary} ? c[a + 1]
+    : op === ${JOB.binary} ? c[a + 2]
+    : op === ${JOB.convStrip} ? c[a + 13]
+    : c[a];
+  const byCols = op === ${JOB.gemm} || op === ${JOB.unary} || op === ${JOB.binary} || op === ${JOB.convStrip};
+  const blocks = count === 1 ? 1 : Math.max(1, Math.min(${BLOCKS_PER_THREAD} * count, byCols ? Math.floor(total / 8) : total));
+  for (;;) {
+    const i = count === 1 ? 0 : Atomics.add(c, ${CLAIM}, 1);
+    if (i >= blocks) break;
+    runBlock(k, c, op, a, i, blocks);
+    if (count === 1) break;
+  }
+}
+function runBlock(k, c, op, a, index, count) {
   if (op === ${JOB.gemm}) {
     const [lo, hi] = shareBy8(c[a + 2], index, count);
     if (lo < hi) k.gemm_range(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], lo, hi);
@@ -185,6 +209,7 @@ export class Pool {
     if (floats) for (const [k, v] of Object.entries(floats)) this.ctrlF[ARG0 + Number(k)] = v;
 
     Atomics.store(this.ctrl, DONE, 0);
+    Atomics.store(this.ctrl, CLAIM, 0);
     Atomics.add(this.ctrl, SEQ, 1);
     Atomics.notify(this.ctrl, SEQ);
 
