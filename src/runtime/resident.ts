@@ -87,6 +87,27 @@ export class Resident {
     return out;
   }
 
+  /**
+   * Concatenation is a move inside the arena: for every slice along the axes
+   * ahead of `axis`, each input's block lands end to end. The TypeScript
+   * fallback instead downloads and re-uploads every input, which at 960x960
+   * was 5.5% of detection.
+   */
+  concat(parts: RT[], axis: number, dims: number[]): RT {
+    const out = this.alloc(dims);
+    const outer = dims.slice(0, axis).reduce((a, b) => a * b, 1);
+    const stride = out.len / outer;
+    let off = 0;
+    for (const p of parts) {
+      const block = p.len / outer;
+      for (let o = 0; o < outer; o++) {
+        this.ar.move(out.ptr + (o * stride + off) * 4, p.ptr + o * block * 4, block);
+      }
+      off += block;
+    }
+    return out;
+  }
+
   maxPool2x2(a: RT): RT {
     const [n, c, h, w] = a.dims;
     const out = this.alloc([n, c, h, w]);

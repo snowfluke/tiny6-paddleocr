@@ -235,9 +235,9 @@ export class Session {
 
   /**
    * Resident dispatch. Ops with a WASM kernel run on pointers; the rest fall
-   * back to the TypeScript implementation, paying a download and upload. Only
-   * shape moves and the two normalisation ops take that path, and they are
-   * under 2% of either model's time.
+   * back to the TypeScript implementation, paying a download and upload of
+   * every input. Keep hot ops off that path: Concat used to take it and cost
+   * 5.5% of detection at 960x960.
    */
   private execResident(r: Resident, n: OnnxNode, x: (RT | null)[]): RT[] {
     const a = x[0]!;
@@ -305,6 +305,14 @@ export class Session {
       case "ReduceMean": {
         const keep = (n.attrs.get("keepdims")?.i ?? 1) !== 0;
         return [r.reduceMean(a, axes(), keep) ?? fallback()[0]];
+      }
+      case "Concat": {
+        const parts = x.filter((t): t is RT => t !== null);
+        const rank = parts[0].dims.length;
+        const ax = ((n.attrs.get("axis")?.i ?? 0) + rank) % rank;
+        const dims = parts[0].dims.slice();
+        dims[ax] = parts.reduce((sum, p) => sum + p.dims[ax], 0);
+        return [r.concat(parts, ax, dims)];
       }
       case "Resize": {
         const scales = x[2] ? [...r.download(x[2]).data] : [];

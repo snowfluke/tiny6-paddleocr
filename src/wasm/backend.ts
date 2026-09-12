@@ -228,6 +228,11 @@ export class Arena {
    * Copy straight into the caller's array. A returned view would dangle after
    * the next memory.grow, and slicing first would copy the data twice.
    */
+  /** Moves f32s inside the arena. Never crosses into JavaScript. */
+  move(dst: number, src: number, n: number) {
+    new Float32Array(this.mem).copyWithin(dst >> 2, src >> 2, (src >> 2) + n);
+  }
+
   readInto(ptr: number, dst: Float32Array) {
     dst.set(new Float32Array(this.mem, ptr, dst.length));
   }
