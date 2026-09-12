@@ -1,0 +1,133 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tiny6-paddleocr</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fbfaf8; --fg: #1a1a1a; --muted: #6b6b6b; --line: #dcd8d2; --accent: #b8502a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #17171a; --fg: #e8e6e3; --muted: #9a9792; --line: #35343a; --accent: #e07a52; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding-block: 28px; padding-inline: 16px; background: var(--bg); color: var(--fg);
+         font: 15px/1.55 ui-sans-serif, system-ui, sans-serif; }
+  main { max-width: 1040px; margin: 0 auto; }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+  .bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 18px; }
+  button, label.file { border: 1px solid var(--line); background: transparent; color: var(--fg);
+      padding: 7px 13px; border-radius: 7px; cursor: pointer; font: inherit; font-size: 13px; }
+  button:hover, label.file:hover { border-color: var(--accent); color: var(--accent); }
+  button[disabled] { opacity: .45; cursor: default; border-color: var(--line); color: var(--fg); }
+  input[type=file] { display: none; }
+  label.toggle { display: inline-flex; gap: 7px; align-items: center; font-size: 13px; color: var(--muted); cursor: pointer; }
+  label.toggle input { accent-color: var(--accent); }
+  #status { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+  @media (max-width: 760px) { .cols { grid-template-columns: minmax(0, 1fr); } }
+  canvas { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; display: block; }
+  pre { margin: 0; padding: 13px; background: color-mix(in srgb, var(--fg) 4%, transparent);
+        border: 1px solid var(--line); border-radius: 8px; font: 12.5px/1.6 ui-monospace, monospace;
+        white-space: pre-wrap; overflow-wrap: anywhere; min-height: 120px; }
+  .stats { margin-top: 12px; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .stats b { color: var(--fg); font-weight: 600; }
+</style>
+
+<main>
+  <h1>tiny6-paddleocr</h1>
+  <p class="sub">PP-OCRv6 tiny in the browser. No runtime dependencies: hand-written ONNX interpreter, WASM SIMD kernels, 25 KB gzipped.</p>
+
+  <div class="bar">
+    <button id="load">Load models</button>
+    <label class="file">Pick an image<input id="file" type="file" accept="image/*"></label>
+    <button id="sample" disabled>Run sample</button>
+    <label class="toggle"><input id="rotated" type="checkbox"> Rotated boxes</label>
+    <span id="status">idle</span>
+  </div>
+
+  <div class="cols">
+    <div><canvas id="view"></canvas></div>
+    <div><pre id="out">Load the models, then pick an image.</pre>
+      <div class="stats" id="stats"></div></div>
+  </div>
+</main>
+
+<script type="module">
+  import { canUseThreads, createOcr, decodeImage } from "./tiny6.js";
+
+  const $ = (id) => document.getElementById(id);
+  const status = (s) => ($("status").textContent = s);
+  let ocr = null;
+  let threadLabel = "";
+
+  $("load").onclick = async () => {
+    $("load").disabled = true;
+    const t0 = performance.now();
+    try {
+      ocr = await createOcr(
+        { detUrl: "models/det.onnx", recUrl: "models/rec.onnx", dictUrl: "models/dict.txt" },
+        (what) => status(`fetching ${what}...`),
+      );
+      const threads = ocr.arena.threads;
+      threadLabel = `${threads} thread${threads > 1 ? "s" : ""}`;
+      // The run status overwrites this line, so keep the thread count in the
+      // stats row where it survives.
+      $("stats").innerHTML = `<b>${threadLabel}</b>` +
+        (canUseThreads() ? "" : " &middot; no SharedArrayBuffer, serve with COOP/COEP for threads");
+      status(`ready in ${Math.round(performance.now() - t0)} ms`);
+      $("sample").disabled = false;
+    } catch (e) {
+      status(`failed: ${e.message}`);
+      $("load").disabled = false;
+    }
+  };
+
+  $("file").onchange = (e) => e.target.files[0] && run(e.target.files[0]);
+  $("sample").onclick = async () => run(await (await fetch("receipt.png")).blob());
+
+  async function run(blob) {
+    if (!ocr) return status("load the models first");
+    status("decoding...");
+    const img = await decodeImage(blob);
+    draw(img, []);
+
+    // Yield once so the canvas paints before the main thread blocks on WASM.
+    status(`running ${img.width}x${img.height}...`);
+    await new Promise((r) => setTimeout(r, 16));
+
+    const opts = { ...ocr.detectDefaults, rotated: document.getElementById("rotated").checked };
+    const t0 = performance.now();
+    const { boxes } = ocr.detect(img, opts);
+    const tDet = performance.now();
+    const lines = ocr.recognizeBoxes(img, boxes);
+    const tAll = performance.now();
+
+    draw(img, boxes);
+    $("out").textContent = lines.map((l) => l.text).join("\n") || "(no text found)";
+    $("stats").innerHTML =
+      `<b>${threadLabel}</b> &middot; detect <b>${Math.round(tDet - t0)} ms</b> &middot; ${boxes.length} boxes &middot; ` +
+      `recognize <b>${Math.round(tAll - tDet)} ms</b> &middot; ${lines.length} lines`;
+    status("done");
+  }
+
+  function draw(img, boxes) {
+    const c = $("view");
+    c.width = img.width;
+    c.height = img.height;
+    const ctx = c.getContext("2d");
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
+    ctx.strokeStyle = "#e0452a";
+    ctx.lineWidth = Math.max(1.5, img.width / 500);
+    for (const b of boxes) {
+      if (!b.rect) {
+        ctx.strokeRect(b.x, b.y, b.width, b.height);
+        continue;
+      }
+      const { cx, cy, width, height, angle } = b.rect;
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(angle);
+      ctx.strokeRect(-width / 2, -height / 2, width, height);
+      ctx.restore();
+    }
+  }
+</script>
