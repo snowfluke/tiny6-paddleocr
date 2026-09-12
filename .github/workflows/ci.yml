@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run typecheck
+
+      # The goldens are ~100 MB of ORT output and are not committed, so the
+      # first test run regenerates them. Cached by model file hash.
+      - uses: actions/cache@v4
+        with:
+          path: test/golden
+          key: goldens-${{ hashFiles('models/*.onnx') }}
+
+      - run: bun test
+      - run: bun run check
