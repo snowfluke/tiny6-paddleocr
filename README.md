@@ -157,16 +157,26 @@ kernel reaches 33-36 GFLOP/s.
 ORT's 79.6 GFLOP/s single-threaded is not reachable from WebAssembly on this
 machine, and the gap is not the kernel.
 
-Sixteen independent accumulator chains with no memory traffic at all, which is
-the most favourable shape a FLOP benchmark can have, measure **48.5 GFLOP/s**
-under Bun. The identical loop written with `f32x4.relaxed_madd` measures 48.5
-as well, so neither JavaScriptCore nor V8 is emitting a fused multiply-add
-here; V8 runs the same module at 21 GFLOP/s.
+Twenty-four independent `f32x4.relaxed_madd` chains with no memory traffic at
+all, which is the most favourable shape a FLOP benchmark can have, measure
+**56.4 GFLOP/s** under Bun. That is the ceiling, and it sits below ORT's 79.6.
+Native code is not reachable from here however good the kernel gets.
 
-So the kernel at 33-36 GFLOP/s already reaches about 70% of what the engine
-can issue, and perfect tuning would land near 48.5, still below native. Effort
-is better spent on what the engine does not cap: fewer passes over memory, and
-threads.
+| chains | GFLOP/s |
+|---|---|
+| 8 | 30.5 |
+| 16 | 54.8 |
+| 24 | **56.4** |
+
+The kernel at 33-36 is about 62% of that ceiling, so a perfect GEMM is worth
+roughly 1.6x, not the 2.3x the raw ORT ratio suggests.
+
+Whether an engine turns `relaxed_madd` into one hardware instruction is not
+settled here, and the obvious microbenchmarks do not answer it: writing the
+same loop as a separate multiply and add lets the compiler hoist the
+loop-invariant multiply out, so the two are not doing equal work. What is
+measured is the kernel itself, where the fused form is neutral on the 1x1
+shapes and worth 15% on 3x3 im2col.
 
 ### Threads
 
@@ -225,7 +235,8 @@ sequence number after reporting ready and so slept through the first job.
   kept, correct and tested, but is not the default.
 - **Packing the GEMM's B operand.** 0.99-1.05x. Removed.
 - **Relaxed SIMD.** `f32x4.relaxed_madd` is in the kernels and is worth 15% on
-  3x3 im2col, but no engine tested actually fuses it. See above.
+  3x3 im2col and nothing on the 1x1 shapes. It needs Chrome 114, Safari 18 or
+  Node 20; there is no fallback build.
 - **`v128.load32_splat` for the GEMM's A operand.** One instruction instead of
   a scalar load plus a splat, and 0.90x measured. JavaScriptCore lowers it
   worse than the pair.
@@ -233,9 +244,9 @@ sequence number after reporting ready and so slept through the first job.
 
 ## Not done
 
-- **A better GEMM still.** 33-36 GFLOP/s against the engine's 48.5 ceiling.
-  Worth about 1.35x on the convolutions if it were perfect, and convolutions
-  are 58% of threaded detection, so call it 1.2x end to end. Cache-tiled loops
+- **A better GEMM still.** 33-36 GFLOP/s against the engine's 56.4 ceiling.
+  Worth about 1.6x on the convolutions if it were perfect, and convolutions
+  are 58% of threaded detection, so call it 1.3x end to end. Cache-tiled loops
   with proper MR x NR blocking are the next step.
 - **The recognition pool in the browser.** The demo gets detection threads but
   runs recognition serially: `src/browser.ts` has no `makeRecWorker`, which
