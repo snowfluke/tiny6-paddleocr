@@ -3,7 +3,10 @@
   // the page is cross-origin isolated and the worker pool gets its threads;
   // GitHub Pages cannot send those headers, which is why it is not used.
   // demo/models and demo/receipt.png are gitignored and staged by
-  // tools/stage-demo.ts before upload.
+  // tools/stage-demo.ts before upload. Deployed by Cloudflare's Git
+  // integration: build command `bun run build && bun tools/stage-demo.ts`,
+  // deploy command `npx wrangler deploy`. `bun run deploy:demo` is the same
+  // from a logged-in machine.
   "name": "tiny6-paddleocr",
   "compatibility_date": "2026-09-13",
   "assets": {
