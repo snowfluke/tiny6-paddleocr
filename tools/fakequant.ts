@@ -39,8 +39,9 @@ export const receipt = await decodePng(await read("test/images/receipt.png"));
 const reference = (await Bun.file("test/images/receipt-reference.txt").text()).trimEnd().split("\n");
 const gt = (await Bun.file("test/images/receipt-gt.txt").text()).trimEnd().split("\n");
 
-type Range = { min: number; max: number };
-export type Mode = "fp32" | "w" | "wa-sym" | "wa-asym";
+/** Per-tensor bounds, plus per-channel bounds along `axis` for the wa-chan mode. */
+type Range = { min: number; max: number; axis: number; cmin: Float32Array; cmax: Float32Array };
+export type Mode = "fp32" | "w" | "wa-sym" | "wa-asym" | "wa-chan";
 
 const isGemm = (n: OnnxNode) => n.opType === "Conv" || n.opType === "MatMul";
 const isHead = (g: OnnxGraph, n: OnnxNode) => (g.initializers.get(n.input[1])?.dims.at(-1) ?? 0) > 1000;
@@ -61,8 +62,20 @@ export async function calibrate(images?: RGBA[], clip = pct): Promise<Calibratio
       if (!wanted.has(name)) return;
       let lo = Infinity, hi = -Infinity;
       for (const v of t.data) { if (v < lo) lo = v; if (v > hi) hi = v; }
-      const r = ranges.get(name) ?? { min: Infinity, max: -Infinity };
-      ranges.set(name, { min: Math.min(r.min, lo), max: Math.max(r.max, hi) });
+      // NCHW activations carry channels on axis 1; the 3-D sequence into the
+      // recognition MatMul carries them last.
+      const axis = t.dims.length === 4 ? 1 : t.dims.length - 1;
+      const C = t.dims[axis];
+      const r = ranges.get(name) ??
+        { min: Infinity, max: -Infinity, axis, cmin: new Float32Array(C).fill(Infinity), cmax: new Float32Array(C).fill(-Infinity) };
+      const inner = t.dims.slice(axis + 1).reduce((a, b) => a * b, 1);
+      for (let i = 0; i < t.data.length; i++) {
+        const c = Math.floor(i / inner) % C;
+        const v = t.data[i];
+        if (v < r.cmin[c]) r.cmin[c] = v;
+        if (v > r.cmax[c]) r.cmax[c] = v;
+      }
+      ranges.set(name, { ...r, min: Math.min(r.min, lo), max: Math.max(r.max, hi) });
       const step = Math.max(1, Math.floor(t.data.length / 16384));
       const pick = new Float32Array(Math.ceil(t.data.length / step));
       for (let i = 0, j = 0; i < t.data.length; i += step) pick[j++] = t.data[i];
@@ -84,7 +97,7 @@ export async function calibrate(images?: RGBA[], clip = pct): Promise<Calibratio
         for (let i = 0, o = 0; i < parts.length; o += parts[i++].length) all.set(parts[i], o);
         all.sort();
         const tail = (all.length - 1) * (1 - clip / 100);
-        out[which].set(name, { min: all[Math.floor(tail)], max: all[Math.ceil(all.length - 1 - tail)] });
+        out[which].set(name, { ...out[which].get(name)!, min: all[Math.floor(tail)], max: all[Math.ceil(all.length - 1 - tail)] });
       }
     }
   }
@@ -94,20 +107,30 @@ export async function calibrate(images?: RGBA[], clip = pct): Promise<Calibratio
 const f32 = (name: string, v: number[], dims: number[] = []): OnnxTensor =>
   ({ name, dims, dataType: 1, data: new Float32Array(v) });
 
-/** Per-output-channel symmetric int8 round trip of a Conv [Cout,...] or MatMul [K,N] weight. */
-function fakeQuantWeight(w: OnnxTensor, op: string): OnnxTensor {
+/**
+ * Per-output-channel symmetric int8 round trip of a Conv [Cout,...] or MatMul
+ * [K,N] weight. With per-input-channel activation scales the kernel would
+ * fold them into the weights first (W' = W * s_in), so the round trip
+ * quantizes W' and unfolds, which is what the int8 result would see.
+ */
+function fakeQuantWeight(w: OnnxTensor, op: string, sIn?: Float32Array): OnnxTensor {
   const src = w.data as Float32Array;
   const out = new Float32Array(src.length);
   const channels = op === "MatMul" ? w.dims[1] : w.dims[0];
+  const per = src.length / channels;
   const at = op === "MatMul"
     ? (c: number, i: number) => i * w.dims[1] + c
-    : (c: number, i: number) => c * (src.length / channels) + i;
-  const per = src.length / channels;
+    : (c: number, i: number) => c * per + i;
+  // Input channel of element i within output channel c.
+  const inCh = op === "MatMul"
+    ? (i: number) => i
+    : (i: number) => Math.floor(i / (w.dims[2] * w.dims[3]));
+  const fold = (c: number, i: number) => (sIn ? sIn[op === "MatMul" ? i : inCh(i)] : 1);
   for (let c = 0; c < channels; c++) {
     let amax = 0;
-    for (let i = 0; i < per; i++) amax = Math.max(amax, Math.abs(src[at(c, i)]));
+    for (let i = 0; i < per; i++) amax = Math.max(amax, Math.abs(src[at(c, i)] * fold(c, i)));
     const s = amax / 127 || 1;
-    for (let i = 0; i < per; i++) out[at(c, i)] = Math.round(src[at(c, i)] / s) * s;
+    for (let i = 0; i < per; i++) out[at(c, i)] = Math.round(src[at(c, i)] * fold(c, i) / s) * s / fold(c, i);
   }
   return { ...w, data: out };
 }
@@ -120,24 +143,44 @@ export function quantizeGraph(g: OnnxGraph, ranges: Map<string, Range>, mode: Mo
   for (const n of g.nodes) {
     if (!isGemm(n) || (!quantHead && isHead(g, n))) { nodes.push(n); continue; }
     const w = initializers.get(n.input[1])!;
-    initializers.set(w.name, fakeQuantWeight(w, n.opType));
     const x = n.input[0];
+    const r = ranges.get(x);
+    if (!r && mode !== "w") throw new Error(`no calibration range for ${x}`);
+    const chan = mode === "wa-chan" && !(only && !only.has(x));
+    const isDepthwise = n.opType === "Conv" && (n.attrs.get("group")?.i ?? 1) > 1;
+    // A depthwise weight is per channel already, so folding a per-channel
+    // activation scale into it changes nothing after symmetric quantization.
+    initializers.set(w.name, fakeQuantWeight(w, n.opType, chan && !isDepthwise ? chanScales(r!)[0] : undefined));
     if (mode === "w" || (only && !only.has(x))) { nodes.push(n); continue; }
     if (!dq.has(x)) {
-      const r = ranges.get(x);
-      if (!r) throw new Error(`no calibration range for ${x}`);
       const sym = mode === "wa-sym";
-      const scale = sym ? Math.max(Math.abs(r.min), Math.abs(r.max)) / 127 : (r.max - r.min) / 255;
-      const zp = sym ? 0 : Math.round(-128 - r.min / scale);
-      initializers.set(`${x}_s`, f32(`${x}_s`, [scale]));
-      initializers.set(`${x}_zp`, f32(`${x}_zp`, [zp]));
-      nodes.push({ name: `${x}_q`, opType: "QuantizeLinear", input: [x, `${x}_s`, `${x}_zp`], output: [`${x}_q`], attrs: new Map() });
-      nodes.push({ name: `${x}_dq`, opType: "DequantizeLinear", input: [`${x}_q`, `${x}_s`, `${x}_zp`], output: [`${x}_dq`], attrs: new Map() });
+      const [scale, zp] = chan
+        ? chanScales(r!)
+        : sym
+        ? [[Math.max(Math.abs(r!.min), Math.abs(r!.max)) / 127], [0]]
+        : [[(r!.max - r!.min) / 255], [Math.round(-128 - r!.min / ((r!.max - r!.min) / 255))]];
+      initializers.set(`${x}_s`, f32(`${x}_s`, [...scale], scale.length > 1 ? [scale.length] : []));
+      initializers.set(`${x}_zp`, f32(`${x}_zp`, [...zp], zp.length > 1 ? [zp.length] : []));
+      const attrs = new Map([["axis", { name: "axis", type: 2, i: r!.axis }]]);
+      nodes.push({ name: `${x}_q`, opType: "QuantizeLinear", input: [x, `${x}_s`, `${x}_zp`], output: [`${x}_q`], attrs });
+      nodes.push({ name: `${x}_dq`, opType: "DequantizeLinear", input: [`${x}_q`, `${x}_s`, `${x}_zp`], output: [`${x}_dq`], attrs });
       dq.set(x, `${x}_dq`);
     }
     nodes.push({ ...n, input: [dq.get(x)!, ...n.input.slice(1)] });
   }
   return { ...g, nodes, initializers };
+}
+
+/** Asymmetric int8 scale and zero point per channel from the calibrated bounds. */
+function chanScales(r: Range): [Float32Array, Float32Array] {
+  const C = r.cmin.length;
+  const scale = new Float32Array(C), zp = new Float32Array(C);
+  for (let c = 0; c < C; c++) {
+    const lo = Math.min(r.cmin[c], 0), hi = Math.max(r.cmax[c], 0);
+    scale[c] = Math.max(hi - lo, 1e-6) / 255;
+    zp[c] = Math.max(-128, Math.min(127, Math.round(-128 - lo / scale[c])));
+  }
+  return [scale, zp];
 }
 
 function editDistance(a: string, b: string): number {
@@ -194,7 +237,7 @@ if (sweep) {
 }
 const configs: [Mode, Mode][] = [
   ["fp32", "fp32"], ["w", "w"], ["wa-sym", "wa-sym"], ["wa-asym", "wa-asym"],
-  ["wa-asym", "fp32"], ["fp32", "wa-asym"],
+  ["wa-asym", "fp32"], ["fp32", "wa-asym"], ["wa-chan", "wa-chan"], ["fp32", "wa-chan"],
 ];
 console.log("\ndet      rec      lines  same/ref  CER/ref  CER/gt");
 const base = await evaluate("fp32", "fp32", cal);

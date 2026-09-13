@@ -385,9 +385,9 @@ export class Session {
       case "MatMul":
         return [matmul(a, x[1]!)];
       case "QuantizeLinear":
-        return [quantizeLinear(a, x[1]!, x[2] ?? null)];
+        return [quantizeLinear(a, x[1]!, x[2] ?? null, n.attrs.get("axis")?.i ?? 1)];
       case "DequantizeLinear":
-        return [dequantizeLinear(a, x[1]!, x[2] ?? null)];
+        return [dequantizeLinear(a, x[1]!, x[2] ?? null, n.attrs.get("axis")?.i ?? 1)];
       case "Add":
         return [binaryFast(a, x[1]!, "add")];
       case "Sub":
