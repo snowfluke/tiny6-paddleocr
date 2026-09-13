@@ -33,6 +33,12 @@ export type Assets = {
    * back to running crops in order on this thread.
    */
   makeRecWorker?: WorkerFactory;
+  /**
+   * Calibration JSON from tools/calibrate.ts. With it the convolutions run
+   * on int8 where the engine supports the relaxed dot product.
+   */
+  detCalib?: string;
+  recCalib?: string;
   /** Recognition workers. Defaults to the same count as `threads`. */
   recWorkers?: number;
 };
@@ -95,12 +101,13 @@ export class Ocr {
 
     const recCount = a.recWorkers ?? defaultRecWorkers();
     const recPool = a.makeRecWorker && recCount > 1
-      ? await RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict }, recCount)
+      ? await RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict, calib: a.recCalib }, recCount)
       : null;
 
+    const int8 = (json?: string) => (json ? { int8: JSON.parse(json) } : {});
     return new Ocr(
-      new Session(parseOnnx(a.det), arena),
-      new Session(parseOnnx(a.rec), arena),
+      new Session(parseOnnx(a.det), arena, int8(a.detCalib)),
+      new Session(parseOnnx(a.rec), arena, int8(a.recCalib)),
       parseDictionary(a.dict),
       arena,
       recPool,

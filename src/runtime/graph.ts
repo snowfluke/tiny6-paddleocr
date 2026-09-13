@@ -16,6 +16,7 @@ import { dequantizeLinear, quantizeLinear } from "../ops/quant.ts";
 import { convResident, convTranspose2x2Resident, matmulResident } from "../ops/conv-wasm.ts";
 import { BIN_OP, lastUseMap, Resident, UN_OP, type RT } from "./resident.ts";
 import { ACT_RELU, dropIdentity, foldBatchNorm, fuseConvEpilogue, fuseGelu } from "./fuse.ts";
+import { buildPlan, type Calibration, isQ, type QPlan, type QVal } from "./qplan.ts";
 import { binaryFast, erfFast, geluFast, hardSigmoidFast, maxPool2x2Same, reduceMeanTrailing, reluFast, resizeNearestFast, sigmoidFast } from "../ops/fast.ts";
 import type { Arena } from "../wasm/backend.ts";
 
@@ -124,6 +125,11 @@ function axesOf(n: OnnxNode, x: (Tensor | null)[]): number[] {
 export type SessionOptions = {
   /** Default true. False runs the graph node for node as exported. */
   fuse?: boolean;
+  /**
+   * Per-channel activation ranges from tools/calibrate.ts. With them the
+   * convolutions the planner can handle run on int8; needs an arena.
+   */
+  int8?: Calibration;
 };
 
 export type RunOptions = {
@@ -140,6 +146,7 @@ export type RunOptions = {
 export class Session {
   private readonly consts = new Map<string, Tensor>();
   private readonly res?: Resident;
+  private readonly plan?: QPlan;
   private readonly residentConsts = new Map<string, RT>();
   private readonly lastUse: Map<string, number>;
   /**
@@ -149,7 +156,7 @@ export class Session {
    */
   private readonly releaseAt: string[][] = [];
   /** Reused across nodes so the input list is not reallocated 219 times. */
-  private readonly scratchInputs: (RT | null)[] = [];
+  private readonly scratchInputs: (QVal | null)[] = [];
 
   readonly graph: OnnxGraph;
 
@@ -160,20 +167,31 @@ export class Session {
    */
   constructor(graph: OnnxGraph, arena?: Arena, opts: SessionOptions = {}) {
     graph = opts.fuse === false ? graph : fuseConvEpilogue(fuseGelu(foldBatchNorm(dropIdentity(graph).graph).graph).graph).graph;
-    this.graph = graph;
     for (const [name, t] of graph.initializers) this.consts.set(name, toTensor(t));
+    if (arena) {
+      // Weights upload now, before any activation, so the arena can seal the
+      // boundary between what persists and what a run may recycle.
+      this.res = new Resident(arena);
+      if (opts.int8) {
+        const built = buildPlan(graph, opts.int8, this.res, this.consts);
+        graph = built.graph;
+        this.plan = built.plan;
+      }
+      for (const [name, t] of this.consts) {
+        this.residentConsts.set(name, this.res.constant(t.data, t.dims));
+      }
+    }
+    this.graph = graph;
     this.lastUse = lastUseMap(graph.nodes, graph.outputs.map((o) => o.name));
     graph.nodes.forEach((n, i) => {
       const dying = [...new Set(n.input)].filter((name) => name && this.lastUse.get(name) === i);
       this.releaseAt.push(dying);
     });
-    if (!arena) return;
-    // Weights upload now, before any activation, so the arena can seal the
-    // boundary between what persists and what a run may recycle.
-    this.res = new Resident(arena);
-    for (const [name, t] of this.consts) {
-      this.residentConsts.set(name, this.res.constant(t.data, t.dims));
-    }
+  }
+
+  /** How many nodes the int8 plan covers; zero without a calibration. */
+  get int8Nodes(): number {
+    return this.plan?.handlers.size ?? 0;
   }
 
   run(feeds: Record<string, Tensor>, opts: RunOptions = {}): Map<string, Tensor> {
@@ -183,7 +201,7 @@ export class Session {
 
   private runResident(r: Resident, feeds: Record<string, Tensor>, opts: RunOptions): Map<string, Tensor> {
     r.ar.beginRun();
-    const env = new Map<string, RT>(this.residentConsts);
+    const env = new Map<string, QVal>(this.residentConsts);
     for (const [k, v] of Object.entries(feeds)) {
       const rt = r.upload(v);
       r.ar.retain(rt.ptr);
@@ -194,6 +212,7 @@ export class Session {
     const inputs = this.scratchInputs;
     for (let i = 0; i < nodes.length; i++) {
       const node = nodes[i];
+      const handler = this.plan?.handlers.get(node);
       inputs.length = node.input.length;
       for (let j = 0; j < node.input.length; j++) {
         const name = node.input[j];
@@ -201,17 +220,23 @@ export class Session {
           inputs[j] = null;
           continue;
         }
-        const t = env.get(name);
+        let t = env.get(name);
         if (!t) throw new Error(`${node.opType} "${node.name}": missing input ${name}`);
+        // An unplanned node reading an int8 tensor gets it back as fp32 once;
+        // the copy takes the name so later readers and the release see it.
+        if (isQ(t) && !handler) {
+          t = this.plan!.asRT(t);
+          env.set(name, t);
+        }
         inputs[j] = t;
       }
-      const outs = this.execResident(r, node, inputs);
+      const outs = handler ? handler(inputs) : this.execResident(r, node, inputs as (RT | null)[]);
       for (let j = 0; j < node.output.length; j++) {
         if (!node.output[j]) continue;
         env.set(node.output[j], outs[j]);
         r.ar.retain(outs[j].ptr);
       }
-      if (opts.onNode) opts.onNode(node, outs.map((o) => r.download(o)));
+      if (opts.onNode) opts.onNode(node, outs.map((o) => r.download(this.plan ? this.plan.asRT(o) : (o as RT))));
       if (opts.onNodeDone) opts.onNodeDone(node);
       // A buffer goes back on the free list once its last reader has run.
       for (const name of this.releaseAt[i]) {
@@ -223,7 +248,7 @@ export class Session {
     const result = new Map<string, Tensor>();
     for (const o of this.graph.outputs) {
       const t = env.get(o.name);
-      if (t) result.set(o.name, r.download(t));
+      if (t) result.set(o.name, r.download(this.plan ? this.plan.asRT(t) : (t as RT)));
     }
     return result;
   }

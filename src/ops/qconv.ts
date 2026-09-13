@@ -138,3 +138,61 @@ export function dequantizeFromQ(r: Resident, q: QT): RT {
   r.ar.k.dequantize_nchw(C, H * W, q.ptr, y.ptr, q.q.ptr.scale, q.q.ptr.zp, 0, H * W);
   return y;
 }
+
+// ---- depthwise ---------------------------------------------------------------
+
+export type DwResident = {
+  kh: number; kw: number; sy: number; sx: number; pt: number; pl: number;
+  ptr: { w: number; sw: number; bias: number };
+};
+
+/**
+ * Per-channel symmetric int8 of a [C,1,kh,kw] weight laid out [tap][C]. The
+ * kernel sums wq * (xq - zp), so the dequant scale is the weight's times the
+ * input's, per channel.
+ */
+export function uploadDepthwise(
+  r: Resident, w: Tensor, bias: Float32Array | null, geom: { sy: number; sx: number; pt: number; pl: number },
+  inScale: Float32Array,
+): DwResident {
+  const [C, , kh, kw] = w.dims;
+  const taps = kh * kw;
+  const wq = new Int8Array(taps * C), sw = new Float32Array(C);
+  for (let c = 0; c < C; c++) {
+    let amax = 0;
+    for (let t = 0; t < taps; t++) amax = Math.max(amax, Math.abs(w.data[c * taps + t]));
+    const s = amax / 127 || 1;
+    sw[c] = s * inScale[c];
+    for (let t = 0; t < taps; t++) wq[t * C + c] = roundHalfEven(w.data[c * taps + t] / s);
+  }
+  return {
+    kh, kw, ...geom,
+    ptr: { w: r.ar.persistBytes(wq), sw: r.ar.persist(sw), bias: r.ar.persist(bias ?? new Float32Array(C)) },
+  };
+}
+
+export function qdepthwise(r: Resident, x: QT, d: DwResident, act: number, out: QParams | null): QT | RT {
+  const [N, C, H, W] = x.dims;
+  const OH = Math.floor((H + 2 * d.pt - d.kh) / d.sy) + 1;
+  const OW = Math.floor((W + 2 * d.pl - d.kw) / d.sx) + 1;
+  const plane = OH * OW;
+  if (out) {
+    const y = allocQ(r, [N, C, OH, OW], out);
+    for (let n = 0; n < N; n++) {
+      r.ar.pQDepthwise([C, H, W, OH, OW, d.kh, d.kw, d.sy, d.sx, d.pt, d.pl, x.ptr + n * C * H * W, x.q.ptr.zp,
+        d.ptr.w, d.ptr.sw, d.ptr.bias, act, y.ptr + n * C * plane, out.ptr.inv, out.ptr.zp, 1]);
+    }
+    return y;
+  }
+  const tmp = r.alloc([N, plane, C]);
+  const y = r.alloc([N, C, OH, OW]);
+  for (let n = 0; n < N; n++) {
+    const t = tmp.ptr + n * plane * C * 4;
+    r.ar.pQDepthwise([C, H, W, OH, OW, d.kh, d.kw, d.sy, d.sx, d.pt, d.pl, x.ptr + n * C * H * W, x.q.ptr.zp,
+      d.ptr.w, d.ptr.sw, d.ptr.bias, act, t, 0, 0, 0]);
+    r.ar.k.transpose_f32(plane, C, t, y.ptr + n * C * plane * 4);
+  }
+  r.ar.release(tmp.ptr);
+  return y;
+}
+

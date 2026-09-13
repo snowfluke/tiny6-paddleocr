@@ -11,7 +11,7 @@ import { loadKernels } from "../wasm/backend.ts";
 import { parseDictionary, recognizeCrop } from "../pipeline/recognize.ts";
 import type { RGBA } from "../image/png.ts";
 
-export type RecInit = { kind: "init"; rec: Uint8Array; wasm: Uint8Array; dict: string };
+export type RecInit = { kind: "init"; rec: Uint8Array; wasm: Uint8Array; dict: string; calib?: string };
 export type RecTask = { kind: "task"; id: number; width: number; height: number; data: Uint8Array };
 export type RecDone = { id: number; text: string; confidence: number; ms: number };
 
@@ -24,7 +24,7 @@ self.onmessage = async (e: MessageEvent<RecInit | RecTask>) => {
   const msg = e.data;
   if (msg.kind === "init") {
     const arena = await loadKernels(msg.wasm);
-    session = new Session(parseOnnx(msg.rec), arena);
+    session = new Session(parseOnnx(msg.rec), arena, msg.calib ? { int8: JSON.parse(msg.calib) } : {});
     dict = parseDictionary(msg.dict);
     postMessage("ready");
     return;

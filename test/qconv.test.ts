@@ -3,7 +3,7 @@ import { loadKernels } from "../src/wasm/backend.ts";
 import { Resident } from "../src/runtime/resident.ts";
 import { conv2d, type ConvAttrs } from "../src/ops/nn.ts";
 import { dequantizeLinear, qgemmReference, quantizeLinear } from "../src/ops/quant.ts";
-import { dequantizeFromQ, prepareQConv, qconv1x1, quantizeToQ, uploadQConv, uploadQParams } from "../src/ops/qconv.ts";
+import { dequantizeFromQ, prepareQConv, qconv1x1, qdepthwise, quantizeToQ, uploadDepthwise, uploadQConv, uploadQParams } from "../src/ops/qconv.ts";
 import type { Tensor } from "../src/runtime/tensor.ts";
 
 const wasm = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
@@ -88,3 +88,31 @@ test("int8 output round-trips through dequantize within one step", async () => {
   }
   arena.destroy();
 });
+
+for (const [C, H, W, k, s] of [[32, 9, 7, 3, 1], [16, 8, 10, 3, 2], [16, 7, 7, 5, 1]]) {
+  test(`int8 depthwise ${k}x${k} stride ${s} tracks the fp32 conv`, async () => {
+    const pad = Math.floor(k / 2);
+    const x = tensor([1, C, H, W], -2, 3);
+    const w = tensor([C, 1, k, k], -0.4, 0.4);
+    const bias = tensor([C], -0.5, 0.5).data;
+    const xq = calibrate(x);
+    const arena = await loadKernels(wasm);
+    const r = new Resident(arena);
+    const xp = uploadQParams(r, xq.scale, xq.zp);
+    const d = uploadDepthwise(r, w, bias, { sy: s, sx: s, pt: pad, pl: pad }, xq.scale);
+    const xr = quantizeToQ(r, r.upload(x), xp);
+    const got = r.download(qdepthwise(r, xr, d, 1, null) as never);
+    const sc = { dims: [C], data: xq.scale }, zp = { dims: [C], data: Float32Array.from(xq.zp) };
+    const xdq = dequantizeLinear(quantizeLinear(x, sc, zp, 1), sc, zp, 1);
+    const ref = conv2d(xdq, w, { dims: [C], data: bias }, { kernel: [k, k], strides: [s, s], pads: [pad, pad, pad, pad], dilations: [1, 1], group: C });
+    expect(got.dims).toEqual(ref.dims);
+    let maxErr = 0, maxRef = 0;
+    for (let i = 0; i < ref.data.length; i++) {
+      const v = Math.max(ref.data[i], 0);
+      maxErr = Math.max(maxErr, Math.abs(got.data[i] - v));
+      maxRef = Math.max(maxRef, Math.abs(v));
+    }
+    expect(maxErr).toBeLessThan(0.02 * maxRef);
+    arena.destroy();
+  });
+}

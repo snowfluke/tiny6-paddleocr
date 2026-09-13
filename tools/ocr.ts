@@ -13,6 +13,9 @@ const ocr = await Ocr.create({
   wasm: await read("src/wasm/kernels.wasm"),
   wasmShared: await read("src/wasm/kernels.shared.wasm"),
   makeRecWorker,
+  ...(process.argv.includes("--int8")
+    ? { detCalib: await Bun.file("models/det.calib.json").text(), recCalib: await Bun.file("models/rec.calib.json").text() }
+    : {}),
 });
 const img = await decodeImage(await read(path));
 

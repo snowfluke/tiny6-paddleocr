@@ -13,7 +13,7 @@
 import type { RGBA } from "../image/png.ts";
 import type { Decoded } from "./recognize.ts";
 
-export type RecPoolAssets = { rec: Uint8Array; wasm: Uint8Array; dict: string };
+export type RecPoolAssets = { rec: Uint8Array; wasm: Uint8Array; dict: string; calib?: string };
 
 /** Supplied by the entry point: Node points at the file, the browser at a blob. */
 export type WorkerFactory = () => Worker;
@@ -46,7 +46,7 @@ export class RecPool {
           w.onmessage = () => resolve(w);
           w.onerror = (e) => reject(new Error(`rec worker failed: ${(e as ErrorEvent).message ?? e}`));
           // Structured clone copies the model bytes into each worker, once.
-          w.postMessage({ kind: "init", rec: assets.rec, wasm: assets.wasm, dict: assets.dict });
+          w.postMessage({ kind: "init", rec: assets.rec, wasm: assets.wasm, dict: assets.dict, calib: assets.calib });
         })),
     );
     const pool = new RecPool(workers);
