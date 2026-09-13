@@ -73,6 +73,32 @@ same kernels (fp32 only, about 15% slower), chosen at load. Threads need `Cross-
 same-origin` and `Cross-Origin-Embedder-Policy: require-corp`
 (`demo/_headers`, `tools/serve.ts`).
 
+## Platforms
+
+One WebAssembly binary runs everywhere; what differs is which kernels the
+engine can take. int8 needs the relaxed dot product lowered as a signed
+dot (`sdot`), which today means ARM. Threads need shared memory: always on
+Bun and Node, in browsers only on a cross-origin-isolated page.
+
+| platform | fp32 | int8 | threads | verified |
+|---|---|---|---|---|
+| macOS ARM64, Bun / Node 21+ | yes | yes | yes | CI, by hand |
+| Linux ARM64, Bun / Node 21+ | yes | yes | yes | CI |
+| Linux x86-64, Bun / Node 21+ | yes | no, fp32 fallback | yes | CI |
+| Windows x86-64, Bun / Node 21+ | yes | no, fp32 fallback | yes | CI |
+| Windows ARM64 | yes | yes | yes | untested |
+| Chrome, Edge, Brave on ARM (macOS, Android) | yes | yes | with COOP/COEP | Chrome and Brave on macOS, by hand |
+| Chrome, Edge, Brave, Firefox 145+ on x86 | yes | no, fp32 fallback | with COOP/COEP | untested |
+| Firefox 145+ on ARM | yes | probe decides | with COOP/COEP | untested |
+| Safari (macOS, iOS) | basic build | no | with COOP/COEP | untested |
+| Chrome < 114, Firefox < 145, Node < 21 | basic build in the browser; no on Node | no | - | untested |
+
+x86 falls back because its engines lower the relaxed dot product to
+`pmaddubsw`, which reads the weights as unsigned and saturates its 16-bit
+pair sums with 8-bit weights. onnxruntime's answer there is 7-bit weights
+(`reduce_range`); measured on SROIE that costs this model 5.7 points of
+token F1, so it is not used. A 7-bit-activation variant is being measured.
+
 ## Benchmarks
 
 720x1280 receipt, 28 text boxes, warm minimum of six runs, same minute,
@@ -172,13 +198,7 @@ your own images.
 
 ## Status
 
-- CI runs the suite on Linux x86-64, Linux ARM64, macOS ARM64 and Windows
-  x86-64, plus the basic kernel build; verified by hand on macOS in Chrome
-  and Brave.
-- int8 needs the signed dot product, so x86 runs fp32 today. A 7-bit weight
-  variant would lift that.
-- Safari runs the basic kernels, fp32 only; not yet tried on a real Safari.
-- The int8 path is batch-1; `recognizeBatch` with a calibration throws.
+- See Platforms: int8 is ARM-only, Safari and Windows ARM are untested.
 - Calibration covers receipts.
 - Determinism is checked every run under load; one 60-image run under
   memory pressure once produced different fp32 text and has not reproduced.
