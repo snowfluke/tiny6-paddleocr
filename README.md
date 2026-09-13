@@ -65,12 +65,13 @@ running. `bun run ab <rev> <model> <dims> <threads>` exports that revision,
 builds it, and alternates which side runs first each round, reporting the
 minimum of each. Every ratio quoted here comes from that.
 
-Four detection threads is the default because this machine has four
-performance cores. Measured at 960x960: 2 threads 180 ms, 4 threads 121 ms, 5
-threads 140 ms, 6 threads 131 ms, 8 threads 129 ms. Every job ends at a
-barrier, so a share that lands on an efficiency core holds up the other three.
-Recognition workers default to six, because task-parallel work has no barrier:
-on the receipt four workers recognise in 93 ms, six in 83, eight in 85.
+Detection uses every core, capped at eight. It used to be four: with static
+shares every job ended at a barrier, so a share landing on an efficiency core
+held up the rest and eight threads measured slower than four. Work is claimed
+in blocks now and a slow core just takes fewer of them; interleaved at
+960x960, four threads 95.7 ms and eight 88.0, and the receipt pipeline
+154 -> 145. Recognition workers default to six: on the receipt four workers
+recognise in 93 ms, six in 83, eight in 85.
 
 Detection at 960x960, as the work landed:
 
@@ -267,9 +268,10 @@ The pool needs `SharedArrayBuffer`, so a page must be cross-origin isolated
 `Cross-Origin-Embedder-Policy: require-corp`; `tools/serve.ts` sends both).
 Without them `canUseThreads()` is false and the runtime stays on one thread.
 
-The default is half the reported cores capped at four. Every job ends at a
-barrier, so on a big.LITTLE machine a share landing on an efficiency core
-holds up the rest: four threads ran 164 ms where eight ran 180 ms.
+The default is every reported core capped at eight. Under static shares it
+was four: every job ends at a barrier, and a share landing on an efficiency
+core held up the rest, 164 ms on four threads against 180 on eight. Block
+claiming removed that; see above.
 
 Instrumenting every dispatch at four threads showed the main thread, which
 runs share 0 and every serial op between kernels, finishing last on 99% of
@@ -348,8 +350,9 @@ usually still right. Each worker now gets its own stack region from the arena.
 - **`v128.load32_splat` for the GEMM's A operand.** One instruction instead of
   a scalar load plus a splat, and 0.90x measured. JavaScriptCore lowers it
   worse than the pair.
-- **More than four detection threads.** Slower on big.LITTLE. See above.
-  Recognition workers are the exception: six beat four, eight did not beat six.
+- **More than four detection threads, under static shares.** Slower on
+  big.LITTLE. Reversed by block claiming; eight is the default now. Recognition
+  workers stay at six: eight did not beat six.
 
 ## Not done
 

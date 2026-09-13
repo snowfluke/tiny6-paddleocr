@@ -245,15 +245,15 @@ export class Pool {
 export const PARALLEL_MIN = 4096;
 
 /**
- * Half the reported cores, capped at four.
+ * Every reported core, capped at eight.
  *
- * Every job ends at a barrier, so the slowest share sets the pace. On a
- * big.LITTLE machine (any Apple silicon, most recent phones) a share landing
- * on an efficiency core holds up the rest: measured on the detection graph at
- * 960x960, four threads ran 164 ms and eight ran 180 ms. Half the core count
- * keeps the work on the fast cores.
+ * With static shares this was half the cores capped at four: every job ended
+ * at a barrier, so a share landing on an efficiency core held up the rest,
+ * and eight threads measured slower than four. With work claimed in blocks
+ * a slow core only takes fewer blocks. Detection at 960x960, interleaved:
+ * four threads 95.7 ms, eight 88.0. The receipt pipeline 154 -> 145.
  */
 export function defaultThreads(): number {
   const n = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 4) : 4;
-  return Math.max(1, Math.min(4, Math.floor(n / 2)));
+  return Math.max(1, Math.min(8, n));
 }
