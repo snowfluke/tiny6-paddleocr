@@ -5,7 +5,10 @@
   // demo/models and demo/receipt.png are gitignored and staged by
   // tools/stage-demo.ts before upload. Deployed by Cloudflare's Git
   // integration: build command `bun run build:web && bun tools/stage-demo.ts`; the
-  // kernels are committed, so the hosted build needs no Rust,
+  // kernels are committed, so the hosted build needs no Rust. It needs no
+  // packages either: onnxruntime is a dev dependency for the golden check
+  // and the benchmarks, so set the build variable SKIP_DEPENDENCY_INSTALL=true
+  // and the runtime's zero dependencies is what gets built,
   // deploy command `npx wrangler deploy`. `bun run deploy:demo` is the same
   // from a logged-in machine.
   "name": "tiny6-paddleocr",
