@@ -12,6 +12,7 @@ import {
   pool2d,
 } from "../ops/nn.ts";
 import { concat, reduceMean, resizeNearest, softmax, squeeze, transpose, unsqueeze } from "../ops/shape.ts";
+import { dequantizeLinear, quantizeLinear } from "../ops/quant.ts";
 import { convResident, convTranspose2x2Resident, matmulResident } from "../ops/conv-wasm.ts";
 import { BIN_OP, lastUseMap, Resident, UN_OP, type RT } from "./resident.ts";
 import { ACT_RELU, fuseConvEpilogue, fuseGelu } from "./fuse.ts";
@@ -291,6 +292,9 @@ export class Session {
       }
       case "MatMul":
         return [matmulResident(r, a, x[1]!)];
+      case "QuantizeLinear":
+      case "DequantizeLinear":
+        return fallback();
       case "Add":
       case "Sub":
       case "Mul":
@@ -380,6 +384,10 @@ export class Session {
         return [convTranspose2d(a, x[1]!, x[2] ?? null, convAttrs(n, a, x[1]!.dims.slice(2)))];
       case "MatMul":
         return [matmul(a, x[1]!)];
+      case "QuantizeLinear":
+        return [quantizeLinear(a, x[1]!, x[2] ?? null)];
+      case "DequantizeLinear":
+        return [dequantizeLinear(a, x[1]!, x[2] ?? null)];
       case "Add":
         return [binaryFast(a, x[1]!, "add")];
       case "Sub":
