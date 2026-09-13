@@ -5,6 +5,11 @@ const bytes = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer
 const { instance } = await WebAssembly.instantiate(bytes, {});
 const k = instance.exports as Record<string, Function> & { memory: WebAssembly.Memory; heap_base: () => number };
 
+// The dot-product kernels need a signed lowering (ARM SDOT); on an engine
+// that reads the weights as unsigned the runtime keeps fp32, and so do these.
+const signedDot = (k.dot_probe as () => number)() === -512;
+const dotTest = test.skipIf(!signedDot);
+
 let seed = 1;
 const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
 const i8 = (n: number, lo = -128, hi = 127) => Int8Array.from({ length: n }, () => Math.floor(lo + rnd() * (hi - lo + 1)));
@@ -41,7 +46,7 @@ const epilogue = (N: number, extra: Partial<QGemmEpilogue> = {}): QGemmEpilogue 
 const shapes: [number, number, number][] = [[8, 4, 8], [16, 64, 16], [13, 12, 24], [1, 8, 8], [9, 160, 32]];
 
 for (const [M, K, N] of shapes) {
-  test(`qgemm ${M}x${K}x${N} matches the integer reference bit for bit`, () => {
+  dotTest(`qgemm ${M}x${K}x${N} matches the integer reference bit for bit`, () => {
     // Weights stay inside 7 bits, the range the relaxed dot product promises.
     const a = i8(M * K), w = i8(K * N, -127, 127);
     for (const act of [0, 1]) {
@@ -55,7 +60,7 @@ for (const [M, K, N] of shapes) {
   });
 }
 
-test("qgemm rows outside [lo, hi) are untouched", () => {
+dotTest("qgemm rows outside [lo, hi) are untouched", () => {
   const [M, K, N] = [24, 16, 16];
   const a = i8(M * K), w = i8(K * N, -127, 127), e = epilogue(N);
   const got = run(M, K, N, e, a, w, 8, 21) as Float32Array;
@@ -67,7 +72,7 @@ test("qgemm rows outside [lo, hi) are untouched", () => {
   }
 });
 
-test("qgemm gelu epilogue is within fp32 noise of the reference", () => {
+dotTest("qgemm gelu epilogue is within fp32 noise of the reference", () => {
   const [M, K, N] = [16, 32, 16];
   const a = i8(M * K), w = i8(K * N, -127, 127);
   const e = epilogue(N, { act: 2, p0: Math.SQRT1_2, p1: 0.5 });

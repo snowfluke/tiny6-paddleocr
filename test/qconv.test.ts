@@ -7,6 +7,9 @@ import { dequantizeFromQ, prepareQConv, qconv1x1, qconvDense, qdepthwise, quanti
 import type { Tensor } from "../src/runtime/tensor.ts";
 
 const wasm = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
+// See qgemm.test.ts: the GEMM-backed convolutions need the signed dot product.
+const signedDot = (await loadKernels(wasm)).signedDot;
+const dotTest = test.skipIf(!signedDot);
 
 let seed = 3;
 const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
@@ -28,7 +31,7 @@ function calibrate(t: Tensor) {
 
 const attrs: ConvAttrs = { kernel: [1, 1], strides: [1, 1], pads: [0, 0, 0, 0], dilations: [1, 1], group: 1 };
 
-test("int8 1x1 conv equals the integer reference and tracks the fp32 conv", async () => {
+dotTest("int8 1x1 conv equals the integer reference and tracks the fp32 conv", async () => {
   const [Cin, Cout, H, W] = [16, 24, 5, 7];
   const x = tensor([1, Cin, H, W], -3, 5);
   const w = tensor([Cout, Cin, 1, 1], -0.5, 0.5);
@@ -68,7 +71,7 @@ test("int8 1x1 conv equals the integer reference and tracks the fp32 conv", asyn
   arena.destroy();
 });
 
-test("int8 output round-trips through dequantize within one step", async () => {
+dotTest("int8 output round-trips through dequantize within one step", async () => {
   const [Cin, Cout, H, W] = [8, 16, 3, 4];
   const x = tensor([1, Cin, H, W], -1, 1);
   const w = tensor([Cout, Cin, 1, 1], -0.5, 0.5);
@@ -118,7 +121,7 @@ for (const [C, H, W, k, s] of [[32, 9, 7, 3, 1], [16, 8, 10, 3, 2], [16, 7, 7, 5
 }
 
 for (const [Cin, Cout, H, W, k, s, pad] of [[3, 16, 9, 11, 3, 2, 1], [32, 16, 8, 7, 3, 1, 1], [16, 8, 6, 6, 2, 1, 0]]) {
-  test(`int8 dense ${k}x${k} stride ${s} Cin ${Cin} tracks the fp32 conv`, async () => {
+  dotTest(`int8 dense ${k}x${k} stride ${s} Cin ${Cin} tracks the fp32 conv`, async () => {
     const x = tensor([1, Cin, H, W], -1, 1);
     const w = tensor([Cout, Cin, k, k], -0.3, 0.3);
     const bias = tensor([Cout], -0.5, 0.5).data;
