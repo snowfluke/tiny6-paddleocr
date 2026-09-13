@@ -2,6 +2,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>tiny6-paddleocr</title>
+<!-- GitHub Pages cannot send COOP/COEP, so this service worker adds them and
+     reloads the page once; without it canUseThreads() is false and the demo
+     runs on one thread. tools/serve.ts sends the real headers locally, where
+     the worker registers and does nothing. -->
+<script src="coi-serviceworker.js"></script>
 <style>
   :root { color-scheme: light dark; --bg: #fbfaf8; --fg: #1a1a1a; --muted: #6b6b6b; --line: #dcd8d2; --accent: #b8502a; }
   @media (prefers-color-scheme: dark) {
