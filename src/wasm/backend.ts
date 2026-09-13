@@ -156,6 +156,11 @@ export class Arena {
     return this.pool?.count ?? 1;
   }
 
+  /** Dispatches where a share ran over a millisecond late, and the time spent waiting for them. */
+  get stalls(): { count: number; ms: number } {
+    return { count: this.pool?.stalls ?? 0, ms: this.pool?.stallMs ?? 0 };
+  }
+
   async startPool(bytes: Uint8Array, threads: number) {
     if (threads <= 1) return;
     // Every worker instantiates the same module on the same shared memory,

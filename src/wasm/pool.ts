@@ -136,8 +136,17 @@ onmessage = async (e) => {
     Atomics.wait(c, ${SEQ}, seen);
     const seq = Atomics.load(c, ${SEQ});
     if (seq < 0) return;
+    // The main thread re-notifies while it waits, so a wake-up with the same
+    // sequence is not a job; running it again would count DONE twice.
+    if (seq === seen) continue;
     seen = seq;
-    runShare(k, c, index, count);
+    try {
+      runShare(k, c, index, count);
+    } catch (e) {
+      // The job's control block is the only way to know which kernel call died.
+      postMessage({ error: String(e), op: c[${OP}], args: Array.from(c.subarray(${ARG0}, ${ARG0} + 24)) });
+      throw e;
+    }
     Atomics.add(c, ${DONE}, 1);
   }
 };
@@ -151,6 +160,11 @@ export class Pool {
   private readonly ctrlF: Float32Array;
   private readonly runShare: ShareFn;
   private url: string | null = null;
+  /** Set when a worker dies after startup; the next dispatch reports it. */
+  private dead: string | null = null;
+  /** Dispatches where a share took over a millisecond after the rest, and the time spent waiting. */
+  stalls = 0;
+  stallMs = 0;
 
   /** `count` includes the calling thread, which always takes share 0. */
   private constructor(
@@ -183,8 +197,15 @@ export class Pool {
         const w = new Worker(url, { type: "module" });
         pool.workers.push(w);
         return new Promise<void>((resolve, reject) => {
-          w.onmessage = () => resolve();
-          w.onerror = (e) => reject(new Error(`worker failed: ${(e as ErrorEvent).message ?? e}`));
+          w.onmessage = (e) => {
+            if (e.data === "ready") resolve();
+            else pool.dead = `worker ${i + 1} died in job ${e.data.op} args [${e.data.args}]: ${e.data.error}`;
+          };
+          w.onerror = (e) => {
+            // The worker posts the kernel arguments before it throws; keep those.
+            pool.dead ??= `worker ${i + 1} failed: ${(e as ErrorEvent).message ?? e}`;
+            reject(new Error(pool.dead));
+          };
           // Stacks grow down, so a worker starts at the top of its slice.
           const stackTop = stackBase + (i + 1) * stackBytes;
           w.postMessage({ bytes, memory, ctrl: ctrlPtr, index: i + 1, count: threads, stackTop });
@@ -216,15 +237,32 @@ export class Pool {
     this.runShare(this.k, this.ctrl, 0, this.count);
 
     // Spin rather than Atomics.wait, which a browser main thread may not call.
-    // Shares finish within a millisecond of each other; the deadline only
-    // exists so a lost worker surfaces as an error instead of a frozen tab.
+    // Shares finish within a millisecond of each other. A share that is late
+    // by more is a worker the OS has not scheduled, or one that missed the
+    // wake-up, so keep notifying while waiting; a wall-clock deadline used to
+    // throw here and a loaded machine tripped it with every worker healthy.
+    // Only a dead worker, or a minute with no share finishing, is an error.
     const want = this.count - 1;
-    const deadline = Date.now() + 10_000;
-    while (Atomics.load(this.ctrl, DONE) < want) {
-      if (Date.now() > deadline) {
-        throw new Error(`worker pool stalled: ${Atomics.load(this.ctrl, DONE)}/${want} shares done`);
+    let done = Atomics.load(this.ctrl, DONE);
+    if (done >= want) return;
+    const t0 = Date.now();
+    let last = t0, progress = t0;
+    for (;;) {
+      const now = Date.now();
+      const d = Atomics.load(this.ctrl, DONE);
+      if (d >= want) break;
+      if (d !== done) { done = d; progress = now; }
+      if (now - last >= 1) {
+        if (last === t0) this.stalls++;
+        last = now;
+        if (this.dead) throw new Error(this.dead);
+        if (now - progress > 60_000) {
+          throw new Error(`worker pool stalled: ${d}/${want} shares done`);
+        }
+        Atomics.notify(this.ctrl, SEQ);
       }
     }
+    if (last !== t0) this.stallMs += Date.now() - t0;
   }
 
   destroy() {

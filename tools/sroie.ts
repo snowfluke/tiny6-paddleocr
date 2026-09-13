@@ -66,6 +66,8 @@ const configs: Config[] = [
   { label: "det int8", det: "wa-asym", rec: "fp32" },
   { label: "rec int8", det: "fp32", rec: "wa-asym" },
   { label: "both int8", det: "wa-asym", rec: "wa-asym" },
+  { label: "rec int8 chan", det: "fp32", rec: "wa-chan" },
+  { label: "both int8 chan", det: "wa-chan", rec: "wa-chan" },
 ];
 const recActs = new Set(cal.rec.keys());
 for (const n of SENSITIVE) recActs.delete(n);
@@ -86,6 +88,7 @@ for (const c of configs) {
     f1.push(tokenF1(text, gt));
     ce.push(cer(text, gt));
   }
+  const stalls = ocr.arena.stalls;
   ocr.destroy();
   if (process.env.SROIE_DUMP) await Bun.write(`${process.env.SROIE_DUMP}/${c.label.replace(/\W+/g, "-")}.txt`, texts.join("\n=====\n"));
   const mean = (v: number[]) => v.reduce((a, b) => a + b, 0) / v.length;
@@ -101,5 +104,5 @@ for (const c of configs) {
     h.update(texts.join("\n"));
     line += `   fp32 text sha ${h.digest("hex").slice(0, 12)}`;
   }
-  console.log(line + `   (${((performance.now() - t0) / 1000).toFixed(0)} s)`);
+  console.log(line + `   (${((performance.now() - t0) / 1000).toFixed(0)} s, ${stalls.count} late shares, ${stalls.ms.toFixed(0)} ms)`);
 }
