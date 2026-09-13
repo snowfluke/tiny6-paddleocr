@@ -85,7 +85,7 @@ export function makeMemoryShared(buf: Uint8Array, maxPages: number): Uint8Array 
   if (existing) throw new Error("module already has imports; merge not implemented");
 
   const out: number[] = [...header];
-  const emit = (id: number, body: ArrayLike<number>) => {
+  const emit = (id: number, body: Uint8Array | number[]) => {
     out.push(id, ...uleb(body.length), ...body);
   };
 

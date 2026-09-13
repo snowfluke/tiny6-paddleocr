@@ -31,7 +31,12 @@ const ACT_RELU: u32 = 1;
 // check against onnxruntime runs at 2e-3.
 #[inline(always)]
 unsafe fn fma(a: v128, b: v128, c: v128) -> v128 {
-    f32x4_relaxed_madd(a, b, c)
+    #[cfg(target_feature = "relaxed-simd")]
+    { f32x4_relaxed_madd(a, b, c) }
+    // The basic build, for engines without relaxed SIMD (Safari): a separate
+    // multiply and add, exact and about 15% slower on the 3x3 convolutions.
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    { f32x4_add(f32x4_mul(a, b), c) }
 }
 
 unsafe fn apply(v: v128, act: u32) -> v128 {
@@ -1000,7 +1005,18 @@ const ACT_GELU: u32 = 2;
 
 #[inline(always)]
 unsafe fn dot(a: v128, b: v128, c: v128) -> v128 {
-    i32x4_relaxed_dot_i8x16_i7x16_add(a, b, c)
+    #[cfg(target_feature = "relaxed-simd")]
+    { i32x4_relaxed_dot_i8x16_i7x16_add(a, b, c) }
+    // Basic build: widen to i16, dot pairs, add adjacent pairs. Correct and
+    // signed, but four instructions where sdot is one, so dot_probe reports
+    // it unusable and the planner keeps such an engine on fp32.
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    {
+        let lo = i32x4_dot_i16x8(i16x8_extend_low_i8x16(a), i16x8_extend_low_i8x16(b));
+        let hi = i32x4_dot_i16x8(i16x8_extend_high_i8x16(a), i16x8_extend_high_i8x16(b));
+        let sum = i32x4_add(i32x4_shuffle::<0, 2, 4, 6>(lo, hi), i32x4_shuffle::<1, 3, 5, 7>(lo, hi));
+        i32x4_add(sum, c)
+    }
 }
 
 /// y = sw[n] * (acc + comp[n]) + bias[n], act, plus the dequantized residual.
@@ -1568,7 +1584,12 @@ pub unsafe extern "C" fn qmaxpool2x2same(c: usize, h: usize, w: usize, x: *const
 /// runtime can keep such an engine on fp32. Same probe MLAS and XNNPACK use.
 #[no_mangle]
 pub unsafe extern "C" fn dot_probe() -> i32 {
-    let a = core::hint::black_box(i8x16_splat(1));
-    let b = core::hint::black_box(i8x16_splat(-128));
-    i32x4_extract_lane::<0>(dot(a, b, i32x4_splat(0)))
+    #[cfg(not(target_feature = "relaxed-simd"))]
+    { return 0; }
+    #[cfg(target_feature = "relaxed-simd")]
+    {
+        let a = core::hint::black_box(i8x16_splat(1));
+        let b = core::hint::black_box(i8x16_splat(-128));
+        i32x4_extract_lane::<0>(dot(a, b, i32x4_splat(0)))
+    }
 }

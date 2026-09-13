@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { packWeights, qdepthwiseReference, qgemmReference, type QGemmEpilogue } from "../src/ops/quant.ts";
 
-const bytes = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
+import { wasm as bytes } from "./kernels.ts";
 const { instance } = await WebAssembly.instantiate(bytes, {});
 const k = instance.exports as Record<string, Function> & { memory: WebAssembly.Memory; heap_base: () => number };
 

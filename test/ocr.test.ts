@@ -11,6 +11,7 @@ import { Session } from "../src/runtime/graph.ts";
 import { dropIdentity, foldBatchNorm, fuseConvEpilogue, fuseGelu } from "../src/runtime/fuse.ts";
 import { loadKernels, loadKernelsThreaded } from "../src/wasm/backend.ts";
 import { compare, unpack } from "../tools/check.ts";
+import { sharedWasm, wasm } from "./kernels.ts";
 
 const read = async (p: string) => new Uint8Array(await Bun.file(p).arrayBuffer());
 
@@ -25,7 +26,6 @@ if (!(await Bun.file("src/wasm/kernels.wasm").exists())) {
   const r = Bun.spawnSync(["bun", "tools/build-wasm.ts"], { stdout: "inherit", stderr: "inherit" });
   if (r.exitCode !== 0) throw new Error("wasm build failed");
 }
-const wasm = await read("src/wasm/kernels.wasm");
 
 /**
  * Every intermediate tensor is diffed against values ORT produced once and
@@ -122,7 +122,6 @@ test("PNG decoder reads both colour types", async () => {
   expect([rgba.width, rgba.height]).toEqual([475, 179]);
 });
 
-const sharedWasm = await read("src/wasm/kernels.shared.wasm");
 
 const makeOcr = async (threads?: number, recWorkers?: number, int8 = false) =>
   Ocr.create({

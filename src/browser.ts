@@ -7,7 +7,7 @@ import { decodePng } from "./image/png.ts";
 
 /** Replaced by tools/build-web.ts with the real base64 payloads. */
 declare const __KERNELS_B64__: string;
-declare const __KERNELS_SHARED_B64__: string;
+declare const __KERNELS_BASIC_B64__: string;
 
 /**
  * Worker threads need SharedArrayBuffer, which a page only gets when it is
@@ -60,6 +60,7 @@ export async function decodeImage(blob: Blob): Promise<RGBA> {
 }
 
 import { measureCores, reportsFakeCores } from "./cores.ts";
+import { makeMemoryShared } from "./wasm/share-memory.ts";
 
 export type WebAssets = {
   detUrl: string;
@@ -76,11 +77,9 @@ export async function createOcr(
   assets: WebAssets,
   onProgress?: (what: string) => void,
 ): Promise<Ocr> {
-  if (!canRunKernels()) {
-    throw new Error(
-      "this browser lacks WebAssembly relaxed SIMD; needs Chrome 114+, Firefox 145+ or Node 21+",
-    );
-  }
+  // Relaxed SIMD (Chrome 114, Firefox 145, Node 21) gets the fast kernels;
+  // Safari gets the basic build: same math, no int8, about 15% slower.
+  const relaxed = canRunKernels();
   const fetchBytes = async (url: string) => {
     onProgress?.(url.split("/").pop() ?? url);
     const r = await fetch(url);
@@ -99,12 +98,13 @@ export async function createOcr(
   const threaded = canUseThreads();
   // Brave reports a random core count per site; measure instead (src/cores.ts).
   const threads = assets.threads ?? (threaded && reportsFakeCores() ? await measureCores() : undefined);
+  const wasm = base64ToBytes(relaxed ? __KERNELS_B64__ : __KERNELS_BASIC_B64__);
   return Ocr.create({
     det,
     rec,
     dict: new TextDecoder().decode(dict),
-    wasm: base64ToBytes(__KERNELS_B64__),
-    wasmShared: threaded ? base64ToBytes(__KERNELS_SHARED_B64__) : undefined,
+    wasm,
+    wasmShared: threaded ? makeMemoryShared(wasm, 32768) : undefined,
     threads: threaded ? threads : 1,
     detCalib,
     recCalib,

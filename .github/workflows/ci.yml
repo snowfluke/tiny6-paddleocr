@@ -34,7 +34,7 @@ jobs:
       - if: matrix.rust
         run: bun run build
       - if: matrix.rust
-        run: git diff --exit-code --stat -- src/wasm/kernels.wasm src/wasm/kernels.shared.wasm
+        run: git diff --exit-code --stat -- src/wasm/kernels.wasm src/wasm/kernels.shared.wasm src/wasm/kernels.basic.wasm
       - run: bun run typecheck
 
       # The goldens are ~100 MB of ORT output and are not committed, so the
@@ -46,3 +46,8 @@ jobs:
 
       - run: bun test
       - run: bun run check
+      # The build without relaxed SIMD, which Safari gets, through the same suite.
+      - if: matrix.rust
+        run: bun test && bun run check
+        env:
+          TINY6_KERNELS: basic

@@ -67,8 +67,9 @@ const ocr = await createOcr({
 const lines = ocr.recognize(await decodeImage(file));
 ```
 
-Needs WebAssembly relaxed SIMD: Chrome 114+, Firefox 145+, Node 21+, Bun.
-Safari keeps it behind a flag. Threads need `Cross-Origin-Opener-Policy:
+Chrome 114+, Firefox 145+, Node 21+ and Bun get the relaxed-SIMD kernels;
+Safari, which keeps relaxed SIMD behind a flag, gets a basic build of the
+same kernels (fp32 only, about 15% slower), chosen at load. Threads need `Cross-Origin-Opener-Policy:
 same-origin` and `Cross-Origin-Embedder-Policy: require-corp`
 (`demo/_headers`, `tools/serve.ts`).
 
@@ -171,11 +172,12 @@ your own images.
 
 ## Status
 
-- Verified on macOS ARM64 (Bun, Chrome, Brave) and Linux x86-64 (CI, fp32).
-  Windows untested.
+- CI runs the suite on Linux x86-64, Linux ARM64, macOS ARM64 and Windows
+  x86-64, plus the basic kernel build; verified by hand on macOS in Chrome
+  and Brave.
 - int8 needs the signed dot product, so x86 runs fp32 today. A 7-bit weight
   variant would lift that.
-- Safari is out until relaxed SIMD ships unflagged.
+- Safari runs the basic kernels, fp32 only; not yet tried on a real Safari.
 - The int8 path is batch-1; `recognizeBatch` with a calibration throws.
 - Calibration covers receipts.
 - Determinism is checked every run under load; one 60-image run under

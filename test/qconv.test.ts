@@ -6,7 +6,7 @@ import { dequantizeLinear, qgemmReference, quantizeLinear } from "../src/ops/qua
 import { dequantizeFromQ, prepareQConv, qconv1x1, qconvDense, qdepthwise, quantizeToQ, uploadDepthwise, uploadQConv, uploadQParams } from "../src/ops/qconv.ts";
 import type { Tensor } from "../src/runtime/tensor.ts";
 
-const wasm = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
+import { wasm } from "./kernels.ts";
 // See qgemm.test.ts: the GEMM-backed convolutions need the signed dot product.
 const signedDot = (await loadKernels(wasm)).signedDot;
 const dotTest = test.skipIf(!signedDot);

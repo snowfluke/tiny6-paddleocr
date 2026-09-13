@@ -1,6 +1,8 @@
-// Builds the kernels twice: a plain module that owns its memory, and a
-// threaded one that imports a shared memory so workers can attach to it.
-// Both come from the same source; only the linker flags differ.
+// Builds the kernels three times from one source: a plain module that owns
+// its memory, a threaded one that imports a shared memory so workers can
+// attach to it, and a basic one without relaxed SIMD for engines that lack
+// it (Safari). The browser derives shared variants at load, so the basic
+// build has none on disk.
 const COMMON = [
   "rustc", "--target", "wasm32-unknown-unknown", "-O",
   "-C", "opt-level=3",
@@ -24,8 +26,9 @@ async function build(out: string, extra: string[]) {
 }
 
 await build("src/wasm/kernels.wasm", ["-C", "target-feature=+simd128,+relaxed-simd"]);
+await build("src/wasm/kernels.basic.wasm", ["-C", "target-feature=+simd128"]);
 
-const { makeMemoryShared } = await import("./share-memory.ts");
+const { makeMemoryShared } = await import("../src/wasm/share-memory.ts");
 const plain = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
 const shared = makeMemoryShared(plain, 32768);
 await Bun.write("src/wasm/kernels.shared.wasm", shared);

@@ -18,6 +18,7 @@ import { type OnnxGraph, type OnnxNode, type OnnxTensor, parseOnnx } from "../sr
 import { decodePng, type RGBA } from "../src/image/png.ts";
 import { DEFAULT_DETECT } from "../src/pipeline/detect.ts";
 import type { Tensor } from "../src/runtime/tensor.ts";
+import { dropIdentity } from "../src/runtime/fuse.ts";
 
 const read = async (p: string) => new Uint8Array(await Bun.file(p).arrayBuffer());
 const argv = process.argv.slice(2);
@@ -33,8 +34,10 @@ export const assets = {
   wasmShared: await read("src/wasm/kernels.shared.wasm"),
   recWorkers: 1,
 };
-export const detGraph = parseOnnx(await read("models/det.onnx"));
-export const recGraph = parseOnnx(await read("models/rec.onnx"));
+// Identity nodes go first so the conv input names match the calibrated
+// (fused) graph's; the Session fuses the rest on top.
+export const detGraph = dropIdentity(parseOnnx(await read("models/det.onnx"))).graph;
+export const recGraph = dropIdentity(parseOnnx(await read("models/rec.onnx"))).graph;
 export const receipt = await decodePng(await read("test/images/receipt.png"));
 const reference = (await Bun.file("test/images/receipt-reference.txt").text()).trimEnd().split("\n");
 const gt = (await Bun.file("test/images/receipt-gt.txt").text()).trimEnd().split("\n");

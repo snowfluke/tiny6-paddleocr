@@ -59,7 +59,7 @@ if (import.meta.main) {
   const t0 = performance.now();
   const useWasm = process.argv.includes("--wasm");
   const arena = useWasm
-    ? await loadKernels(new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer()))
+    ? await loadKernels(new Uint8Array(await Bun.file(process.env.TINY6_KERNELS === "basic" ? "src/wasm/kernels.basic.wasm" : "src/wasm/kernels.wasm").arrayBuffer()))
     : undefined;
   const s = new Session(g, arena, { fuse: false });
   s.run(feeds, {
