@@ -1,0 +1,9 @@
+# A Windows checkout must not turn the dictionary or the reference texts
+# into CRLF: every character would grow a trailing \r.
+* text=auto eol=lf
+*.onnx binary
+*.wasm binary
+*.bin binary
+*.png binary
+*.jpg binary
+*.jpeg binary
