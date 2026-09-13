@@ -76,6 +76,28 @@ export function fuseGelu(g: OnnxGraph): { graph: OnnxGraph; fused: number } {
   return { graph: { ...g, nodes }, fused: replace.size };
 }
 
+/**
+ * Drops Identity nodes by pointing their readers at the source tensor. The
+ * recognition export puts one after every convolution, so without this the
+ * Conv -> Add and Conv -> Gelu patterns below never see each other: an
+ * Identity in between left recognition with no residual fusions at all.
+ * An Identity that produces a graph output stays.
+ */
+export function dropIdentity(g: OnnxGraph): { graph: OnnxGraph; dropped: number } {
+  const outputs = new Set(g.outputs.map((o) => o.name));
+  const alias = new Map<string, string>();
+  const nodes: OnnxNode[] = [];
+  for (const n of g.nodes) {
+    const input = n.input.map((i) => alias.get(i) ?? i);
+    if (n.opType === "Identity" && !outputs.has(n.output[0])) {
+      alias.set(n.output[0], input[0]);
+      continue;
+    }
+    nodes.push(input.some((i, k) => i !== n.input[k]) ? { ...n, input } : n);
+  }
+  return alias.size ? { graph: { ...g, nodes }, dropped: alias.size } : { graph: g, dropped: 0 };
+}
+
 /** How many times each tensor is read, counting graph outputs as a reader. */
 function readerCount(g: OnnxGraph): Map<string, number> {
   const readers = new Map<string, number>();

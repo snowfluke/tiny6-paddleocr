@@ -15,7 +15,7 @@ import { concat, reduceMean, resizeNearest, softmax, squeeze, transpose, unsquee
 import { dequantizeLinear, quantizeLinear } from "../ops/quant.ts";
 import { convResident, convTranspose2x2Resident, matmulResident } from "../ops/conv-wasm.ts";
 import { BIN_OP, lastUseMap, Resident, UN_OP, type RT } from "./resident.ts";
-import { ACT_RELU, fuseConvEpilogue, fuseGelu } from "./fuse.ts";
+import { ACT_RELU, dropIdentity, fuseConvEpilogue, fuseGelu } from "./fuse.ts";
 import { binaryFast, erfFast, geluFast, hardSigmoidFast, maxPool2x2Same, reduceMeanTrailing, reluFast, resizeNearestFast, sigmoidFast } from "../ops/fast.ts";
 import type { Arena } from "../wasm/backend.ts";
 
@@ -159,7 +159,7 @@ export class Session {
    * the golden check does so it still sees every intermediate tensor.
    */
   constructor(graph: OnnxGraph, arena?: Arena, opts: SessionOptions = {}) {
-    graph = opts.fuse === false ? graph : fuseConvEpilogue(fuseGelu(graph).graph).graph;
+    graph = opts.fuse === false ? graph : fuseConvEpilogue(fuseGelu(dropIdentity(graph).graph).graph).graph;
     this.graph = graph;
     for (const [name, t] of graph.initializers) this.consts.set(name, toTensor(t));
     this.lastUse = lastUseMap(graph.nodes, graph.outputs.map((o) => o.name));
