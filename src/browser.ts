@@ -22,7 +22,8 @@ export function canUseThreads(): boolean {
 /**
  * One function taking three v128s and returning f32x4.relaxed_madd of them.
  * The kernels are built with relaxed SIMD, so an engine that cannot validate
- * this cannot run them: Chrome 114, Safari 18 and Node 20 are the floors.
+ * this cannot run them: Chrome 114, Firefox 145 and Node 21 are the floors;
+ * Safari keeps relaxed SIMD behind a flag.
  */
 const RELAXED_SIMD_PROBE = Uint8Array.from([
   0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
@@ -77,7 +78,7 @@ export async function createOcr(
 ): Promise<Ocr> {
   if (!canRunKernels()) {
     throw new Error(
-      "this browser lacks WebAssembly relaxed SIMD; needs Chrome 114+, Safari 18+ or Node 20+",
+      "this browser lacks WebAssembly relaxed SIMD; needs Chrome 114+, Firefox 145+ or Node 21+",
     );
   }
   const fetchBytes = async (url: string) => {
