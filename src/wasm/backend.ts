@@ -43,6 +43,7 @@ export type Kernels = {
     out: number, oinv: number, ozp: number, outI8: number, lo: number, hi: number,
   ): void;
   qmean_channels(c: number, pixels: number, x: number, zp: number, scale: number, out: number): void;
+  dot_probe(): number;
   qscale_channels(c: number, x: number, zp: number, scale: number, factor: number, out: number, oinv: number, ozp: number, lo: number, hi: number): void;
   quantize_nhwc(channels: number, cs: number, pixels: number, x: number, out: number, inv: number, zp: number, lo: number, hi: number): void;
   qim2col(
@@ -178,6 +179,11 @@ export class Arena {
 
   get threads(): number {
     return this.pool?.count ?? 1;
+  }
+
+  /** Whether the engine's relaxed dot product is signed on both operands, which the int8 kernels need. */
+  get signedDot(): boolean {
+    return this.k.dot_probe() === -512;
   }
 
   /** Dispatches where a share ran over a millisecond late, and the time spent waiting for them. */

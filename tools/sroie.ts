@@ -6,7 +6,8 @@
 // SROIE ground truth is uppercased and split inconsistently, so the score is
 // order-independent token F1 (bag of words, uppercased) and a normalized CER
 // (uppercase, whitespace stripped). Both are paired per image against fp32.
-import { calibrate, type Mode, quantizedOcr } from "./fakequant.ts";
+import { assets, calibrate, type Mode, quantizedOcr } from "./fakequant.ts";
+import { Ocr } from "../src/ocr.ts";
 import { decodeImage } from "../src/image/jpeg.ts";
 import { DEFAULT_DETECT } from "../src/pipeline/detect.ts";
 import type { RGBA } from "../src/image/png.ts";
@@ -60,9 +61,10 @@ const images: [string, RGBA, string][] = [];
 for (const n of evalNames) images.push([n, await load(n), await truth(n)]);
 console.log(`calibrated on ${CALIB} receipts at p${clip}, scoring ${images.length} others, ${images.reduce((a, [, , g]) => a + flat(g).length, 0)} GT characters`);
 
-type Config = { label: string; det: Mode; rec: Mode; only?: Set<string> };
+type Config = { label: string; det: Mode; rec: Mode; only?: Set<string>; kernels?: boolean };
 const configs: Config[] = [
   { label: "fp32", det: "fp32", rec: "fp32" },
+  { label: "int8 kernels", det: "wa-chan", rec: "wa-chan", kernels: true },
   { label: "det int8", det: "wa-asym", rec: "fp32" },
   { label: "rec int8", det: "fp32", rec: "wa-asym" },
   { label: "both int8", det: "wa-asym", rec: "wa-asym" },
@@ -75,11 +77,22 @@ configs.push({ label: "both, 8 rec fp32", det: "wa-asym", rec: "wa-asym", only: 
 
 // SROIE_CONFIGS=fp32,rec int8 limits the run; SROIE_DUMP=dir writes each config's text.
 const wanted = process.env.SROIE_CONFIGS?.split(",");
+/** The real int8 path: calibrate with tools/calibrate.ts on the same receipts, then load the JSON. */
+async function kernelOcr(): Promise<Ocr> {
+  const p = Bun.spawnSync(["bun", "tools/calibrate.ts", ...calibNames.map((n) => `${dir}/img/${n}`)]);
+  if (p.exitCode !== 0) throw new Error(new TextDecoder().decode(p.stderr));
+  const read = async (f: string) => new Uint8Array(await Bun.file(f).arrayBuffer());
+  return Ocr.create({
+    ...assets, det: await read("models/det.onnx"), rec: await read("models/rec.onnx"),
+    detCalib: await Bun.file("models/det.calib.json").text(), recCalib: await Bun.file("models/rec.calib.json").text(),
+  });
+}
+
 let base: { f1: number[]; cer: number[] } | null = null;
 console.log("\nconfig             tokenF1   CER     vs fp32: F1 delta   worse/better images");
 for (const c of configs) {
   if (wanted && !wanted.includes(c.label)) continue;
-  const ocr = await quantizedOcr(c.det, c.rec, cal, c.only);
+  const ocr = c.kernels ? await kernelOcr() : await quantizedOcr(c.det, c.rec, cal, c.only);
   const f1: number[] = [], ce: number[] = [], texts: string[] = [];
   const t0 = performance.now();
   for (const [, img, gt] of images) {

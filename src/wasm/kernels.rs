@@ -1560,3 +1560,15 @@ pub unsafe extern "C" fn qmaxpool2x2same(c: usize, h: usize, w: usize, x: *const
         }
     }
 }
+
+/// The relaxed dot product only promises a 7-bit second operand; the int8
+/// kernels feed it full int8 weights and rely on the engine lowering to a
+/// signed dot (ARM SDOT). This returns -512 where that holds and +512 where
+/// the engine treats the operand as unsigned (x86 pmaddubsw), so the
+/// runtime can keep such an engine on fp32. Same probe MLAS and XNNPACK use.
+#[no_mangle]
+pub unsafe extern "C" fn dot_probe() -> i32 {
+    let a = core::hint::black_box(i8x16_splat(1));
+    let b = core::hint::black_box(i8x16_splat(-128));
+    i32x4_extract_lane::<0>(dot(a, b, i32x4_splat(0)))
+}
