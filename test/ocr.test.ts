@@ -147,7 +147,8 @@ test("reads short upright text exactly", async () => {
  * out right most runs. Every node's output must match the single-threaded
  * run exactly, and repeatedly, since a race only shows on some schedules.
  */
-test("worker threads are bit-identical at every node", async () => {
+for (const threads of [4, 8]) {
+test(`worker threads are bit-identical at every node (${threads} threads)`, async () => {
   const g = parseOnnx(await read("models/det.onnx"));
   const dims = [1, 3, 256, 320];
   const n = dims.reduce((a, b) => a * b, 1);
@@ -162,7 +163,7 @@ test("worker threads are bit-identical at every node", async () => {
   const ref = new Map<string, Float32Array>();
   one.run(feeds, { onNode: (node, outs) => node.output.forEach((o, i) => ref.set(o, outs[i].data)) });
 
-  const arena = await loadKernelsThreaded(sharedWasm, 4);
+  const arena = await loadKernelsThreaded(sharedWasm, threads);
   const four = new Session(g, arena);
   const bad: string[] = [];
   for (let rep = 0; rep < 6; rep++) {
@@ -182,6 +183,7 @@ test("worker threads are bit-identical at every node", async () => {
   arena.destroy();
   expect(bad).toEqual([]);
 }, 120_000);
+}
 
 test("worker threads change nothing but the wall clock", async () => {
   const img = await decodePng(await read("test/images/receipt.png"));
