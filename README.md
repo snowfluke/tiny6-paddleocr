@@ -75,29 +75,34 @@ same-origin` and `Cross-Origin-Embedder-Policy: require-corp`
 
 ## Platforms
 
-One WebAssembly binary runs everywhere; what differs is which kernels the
-engine can take. int8 needs the relaxed dot product lowered as a signed
-dot (`sdot`), which today means ARM. Threads need shared memory: always on
-Bun and Node, in browsers only on a cross-origin-isolated page.
+One WebAssembly binary runs everywhere; what differs is how the engine
+lowers the relaxed dot product. A probe at start-up tells: signed (ARM
+`sdot`: full int8), unsigned (x86 `pmaddubsw`: weights offset by 128,
+activations 7-bit, a row-sum correction), or neither (the basic build:
+fp32). Threads need shared memory: always on Bun and Node, in browsers
+only on a cross-origin-isolated page.
 
 | platform | fp32 | int8 | threads | verified |
 |---|---|---|---|---|
 | macOS ARM64, Bun / Node 21+ | yes | yes | yes | CI, by hand |
 | Linux ARM64, Bun / Node 21+ | yes | yes | yes | CI |
-| Linux x86-64, Bun / Node 21+ | yes | no, fp32 fallback | yes | CI |
-| Windows x86-64, Bun / Node 21+ | yes | no, fp32 fallback | yes | CI |
+| Linux x86-64, Bun / Node 21+ | yes | yes, 7-bit activations | yes | CI |
+| Windows x86-64, Bun / Node 21+ | yes | yes, 7-bit activations | yes | CI |
 | Windows ARM64 | yes | yes | yes | untested |
 | Chrome, Edge, Brave on ARM (macOS, Android) | yes | yes | with COOP/COEP | Chrome and Brave on macOS, by hand |
-| Chrome, Edge, Brave, Firefox 145+ on x86 | yes | no, fp32 fallback | with COOP/COEP | untested |
+| Chrome, Edge, Brave, Firefox 145+ on x86 | yes | yes, 7-bit activations | with COOP/COEP | untested |
 | Firefox 145+ on ARM | yes | probe decides | with COOP/COEP | untested |
 | Safari (macOS, iOS) | basic build | no | with COOP/COEP | untested |
 | Chrome < 114, Firefox < 145, Node < 21 | basic build in the browser; no on Node | no | - | untested |
 
-x86 falls back because its engines lower the relaxed dot product to
-`pmaddubsw`, which reads the weights as unsigned and saturates its 16-bit
-pair sums with 8-bit weights. onnxruntime's answer there is 7-bit weights
-(`reduce_range`); measured on SROIE that costs this model 5.7 points of
-token F1, so it is not used. A 7-bit-activation variant is being measured.
+x86 engines read the dot product's weight operand as unsigned and their
+16-bit pair sums saturate with 8-bit weights against 8-bit activations.
+onnxruntime's answer is 7-bit weights (`reduce_range`); measured on SROIE
+that costs this model 5.7 points of token F1. 7-bit activations with 8-bit
+weights cost nothing (80.30% against fp32's 79.13%), so that is the x86
+mode. Its kernels match the same integer reference as ARM's, bit for bit,
+on the x86 CI legs. Speed on x86 is unmeasured; expect about 2x over fp32
+there, not the 4-5x of `sdot`, since the lowering is three instructions.
 
 ## Benchmarks
 
@@ -198,7 +203,7 @@ your own images.
 
 ## Status
 
-- See Platforms: int8 is ARM-only, Safari and Windows ARM are untested.
+- See Platforms: Safari, Windows ARM and every x86 browser are untested by hand.
 - Calibration covers receipts.
 - Determinism is checked every run under load; one 60-image run under
   memory pressure once produced different fp32 text and has not reproduced.
