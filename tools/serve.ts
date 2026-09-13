@@ -1,17 +1,10 @@
 // Dev server for the demo. The COOP/COEP pair is what makes
 // SharedArrayBuffer available, and without it the runtime cannot start
 // worker threads and silently falls back to one.
-const root = "demo";
+import { stageDemo } from "./stage-demo.ts";
 
-// demo/models is gitignored, so stage it here rather than making a fresh
-// clone fail with three 404s.
-for (const f of ["models/det.onnx", "models/rec.onnx", "models/dict.txt"]) {
-  const dst = `${root}/${f}`;
-  if (!(await Bun.file(dst).exists())) await Bun.write(dst, Bun.file(f));
-}
-if (!(await Bun.file(`${root}/receipt.png`).exists())) {
-  await Bun.write(`${root}/receipt.png`, Bun.file("test/images/receipt.png"));
-}
+const root = "demo";
+await stageDemo(root);
 const server = Bun.serve({
   port: 8099,
   async fetch(req) {
