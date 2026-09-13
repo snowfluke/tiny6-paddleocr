@@ -58,6 +58,8 @@ export async function decodeImage(blob: Blob): Promise<RGBA> {
   return { width: img.width, height: img.height, data: new Uint8Array(img.data.buffer) };
 }
 
+import { measureCores, reportsFakeCores } from "./cores.ts";
+
 export type WebAssets = {
   detUrl: string;
   recUrl: string;
@@ -94,17 +96,19 @@ export async function createOcr(
   ]);
   onProgress?.("kernels");
   const threaded = canUseThreads();
+  // Brave reports a random core count per site; measure instead (src/cores.ts).
+  const threads = assets.threads ?? (threaded && reportsFakeCores() ? await measureCores() : undefined);
   return Ocr.create({
     det,
     rec,
     dict: new TextDecoder().decode(dict),
     wasm: base64ToBytes(__KERNELS_B64__),
     wasmShared: threaded ? base64ToBytes(__KERNELS_SHARED_B64__) : undefined,
-    threads: assets.threads ?? (threaded ? undefined : 1),
+    threads: threaded ? threads : 1,
     detCalib,
     recCalib,
   });
 }
 
-export { decodePng, Ocr };
+export { decodePng, measureCores, Ocr };
 export type { OcrLine, RGBA };

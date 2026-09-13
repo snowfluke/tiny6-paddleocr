@@ -88,6 +88,14 @@ in blocks now and a slow core just takes fewer of them; interleaved at
 154 -> 145. Recognition workers default to six: on the receipt four workers
 recognise in 93 ms, six in 83, eight in 85.
 
+Brave reports a random core count per site (a fingerprinting defence), which
+would leave the pool on a fraction of the machine. The cores themselves are
+not hidden, so on Brave `createOcr` measures them: the same loop on 1, 2, 4
+and 8 workers at once, summing single-time over each-time as core
+equivalents, stopping when more workers stop adding throughput. About 30 ms
+once per origin, cached (`src/cores.ts`). This M1 with four performance and
+four efficiency cores measures 8.
+
 Detection at 960x960, as the work landed:
 
 | | ms |
