@@ -109,24 +109,27 @@ export function qconv1x1(
   r: Resident, x: QT, w: QConvResident, act: number, p0: number, p1: number,
   residual: QT | null, out: QParams | null,
 ): QT | RT {
-  const [n, , H, W] = x.dims;
-  if (n !== 1) throw new Error("qconv1x1: batch 1 only");
+  const [B, , H, W] = x.dims;
   if (x.cs !== w.K) throw new Error(`qconv1x1: channel stride ${x.cs} but K ${w.K}`);
   const M = H * W, N = w.N;
-  const rptr = residual ? residual.ptr : 0;
   const rs = residual ? residual.q.ptr.scale : 0;
   const rzp = residual ? residual.q.ptr.zp : 0;
+  // Batch items are independent; each runs at its own offset.
   if (out) {
-    const y = allocQ(r, [1, N, H, W], out);
-    r.ar.pQGemm([M, w.K, N, x.ptr, w.ptr.packed, y.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act,
-      rptr, rs, rzp, out.ptr.inv, out.ptr.zp, 1], p0, p1);
+    const y = allocQ(r, [B, N, H, W], out);
+    for (let b = 0; b < B; b++) {
+      r.ar.pQGemm([M, w.K, N, x.ptr + b * M * x.cs, w.ptr.packed, y.ptr + b * M * N, w.ptr.sw, w.ptr.bias, w.ptr.comp, act,
+        residual ? residual.ptr + b * M * N : 0, rs, rzp, out.ptr.inv, out.ptr.zp, 1], p0, p1);
+    }
     return y;
   }
   const tmp = r.alloc([M, N]);
-  r.ar.pQGemm([M, w.K, N, x.ptr, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act,
-    rptr, rs, rzp, 0, 0, 0], p0, p1);
-  const y = r.alloc([1, N, H, W]);
-  r.ar.pTranspose(M, N, tmp.ptr, y.ptr);
+  const y = r.alloc([B, N, H, W]);
+  for (let b = 0; b < B; b++) {
+    r.ar.pQGemm([M, w.K, N, x.ptr + b * M * x.cs, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act,
+      residual ? residual.ptr + b * M * N : 0, rs, rzp, 0, 0, 0], p0, p1);
+    r.ar.pTranspose(M, N, tmp.ptr, y.ptr + b * M * N * 4);
+  }
   r.ar.release(tmp.ptr);
   return y;
 }
@@ -150,23 +153,26 @@ export type DenseGeom = { kh: number; kw: number; sy: number; sx: number; pt: nu
 export function qconvDense(
   r: Resident, x: QT, w: QConvResident, g: DenseGeom, act: number, p0: number, p1: number, out: QParams | null,
 ): QT | RT {
-  const [n, , H, W] = x.dims;
-  if (n !== 1) throw new Error("qconvDense: batch 1 only");
+  const [B, , H, W] = x.dims;
   const OH = Math.floor((H + g.pt + g.pb - g.kh) / g.sy) + 1;
   const OW = Math.floor((W + g.pl + g.pr - g.kw) / g.sx) + 1;
   const M = OH * OW, N = w.N;
   if (g.kh * g.kw * x.cs !== w.K) throw new Error(`qconvDense: K ${g.kh * g.kw * x.cs} but weights have ${w.K}`);
   const col = r.ar.allocScratch((M * w.K + 3) >> 2);
-  const geom = [H, W, OH, OW, g.kh, g.kw, g.sy, g.sx, g.pt, g.pl, x.cs, x.ptr, x.q.ptr.zp, col];
+  const geom = (b: number) => [H, W, OH, OW, g.kh, g.kw, g.sy, g.sx, g.pt, g.pl, x.cs, x.ptr + b * H * W * x.cs, x.q.ptr.zp, col];
   let y: QT | RT;
   if (out) {
-    y = allocQ(r, [1, N, OH, OW], out);
-    r.ar.pQConvDense([...geom, N, w.ptr.packed, y.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, out.ptr.inv, out.ptr.zp, 1], p0, p1);
+    y = allocQ(r, [B, N, OH, OW], out);
+    for (let b = 0; b < B; b++) {
+      r.ar.pQConvDense([...geom(b), N, w.ptr.packed, y.ptr + b * M * N, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, out.ptr.inv, out.ptr.zp, 1], p0, p1);
+    }
   } else {
     const tmp = r.alloc([M, N]);
-    r.ar.pQConvDense([...geom, N, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, 0, 0, 0], p0, p1);
-    y = r.alloc([1, N, OH, OW]);
-    r.ar.pTranspose(M, N, tmp.ptr, y.ptr);
+    y = r.alloc([B, N, OH, OW]);
+    for (let b = 0; b < B; b++) {
+      r.ar.pQConvDense([...geom(b), N, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, 0, 0, 0], p0, p1);
+      r.ar.pTranspose(M, N, tmp.ptr, y.ptr + b * M * N * 4);
+    }
     r.ar.release(tmp.ptr);
   }
   r.ar.release(col);

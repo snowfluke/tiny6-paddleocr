@@ -41,7 +41,7 @@ const gt = (await Bun.file("test/images/receipt-gt.txt").text()).trimEnd().split
 
 /** Per-tensor bounds, plus per-channel bounds along `axis` for the wa-chan mode. */
 type Range = { min: number; max: number; axis: number; cmin: Float32Array; cmax: Float32Array };
-export type Mode = "fp32" | "w" | "wa-sym" | "wa-asym" | "wa-chan";
+export type Mode = "fp32" | "w" | "wa-sym" | "wa-asym" | "wa-chan" | "wa-chan7";
 
 const isGemm = (n: OnnxNode) => n.opType === "Conv" || n.opType === "MatMul";
 const isHead = (g: OnnxGraph, n: OnnxNode) => (g.initializers.get(n.input[1])?.dims.at(-1) ?? 0) > 1000;
@@ -113,7 +113,7 @@ const f32 = (name: string, v: number[], dims: number[] = []): OnnxTensor =>
  * fold them into the weights first (W' = W * s_in), so the round trip
  * quantizes W' and unfolds, which is what the int8 result would see.
  */
-function fakeQuantWeight(w: OnnxTensor, op: string, sIn?: Float32Array): OnnxTensor {
+function fakeQuantWeight(w: OnnxTensor, op: string, sIn?: Float32Array, bits7 = false): OnnxTensor {
   const src = w.data as Float32Array;
   const out = new Float32Array(src.length);
   const channels = op === "MatMul" ? w.dims[1] : w.dims[0];
@@ -127,6 +127,19 @@ function fakeQuantWeight(w: OnnxTensor, op: string, sIn?: Float32Array): OnnxTen
     : (i: number) => Math.floor(i / (w.dims[2] * w.dims[3]));
   const fold = (c: number, i: number) => (sIn ? sIn[op === "MatMul" ? i : inCh(i)] : 1);
   for (let c = 0; c < channels; c++) {
+    if (bits7) {
+      // Asymmetric [0,127] with a zero point: what the relaxed dot product
+      // promises on every engine (its second operand is 7-bit).
+      let lo = 0, hi = 0;
+      for (let i = 0; i < per; i++) { const v = src[at(c, i)] * fold(c, i); lo = Math.min(lo, v); hi = Math.max(hi, v); }
+      const s = (hi - lo) / 127 || 1;
+      const zp = Math.round(-lo / s);
+      for (let i = 0; i < per; i++) {
+        const q = Math.max(0, Math.min(127, Math.round(src[at(c, i)] * fold(c, i) / s) + zp));
+        out[at(c, i)] = (q - zp) * s / fold(c, i);
+      }
+      continue;
+    }
     let amax = 0;
     for (let i = 0; i < per; i++) amax = Math.max(amax, Math.abs(src[at(c, i)] * fold(c, i)));
     const s = amax / 127 || 1;
@@ -146,11 +159,11 @@ export function quantizeGraph(g: OnnxGraph, ranges: Map<string, Range>, mode: Mo
     const x = n.input[0];
     const r = ranges.get(x);
     if (!r && mode !== "w") throw new Error(`no calibration range for ${x}`);
-    const chan = mode === "wa-chan" && !(only && !only.has(x));
+    const chan = (mode === "wa-chan" || mode === "wa-chan7") && !(only && !only.has(x));
     const isDepthwise = n.opType === "Conv" && (n.attrs.get("group")?.i ?? 1) > 1;
     // A depthwise weight is per channel already, so folding a per-channel
     // activation scale into it changes nothing after symmetric quantization.
-    initializers.set(w.name, fakeQuantWeight(w, n.opType, chan && !isDepthwise ? chanScales(r!)[0] : undefined));
+    initializers.set(w.name, fakeQuantWeight(w, n.opType, chan && !isDepthwise ? chanScales(r!)[0] : undefined, mode === "wa-chan7" && !isDepthwise));
     if (mode === "w" || (only && !only.has(x))) { nodes.push(n); continue; }
     if (!dq.has(x)) {
       const sym = mode === "wa-sym";

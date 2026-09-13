@@ -65,6 +65,7 @@ type Config = { label: string; det: Mode; rec: Mode; only?: Set<string>; kernels
 const configs: Config[] = [
   { label: "fp32", det: "fp32", rec: "fp32" },
   { label: "int8 kernels", det: "wa-chan", rec: "wa-chan", kernels: true },
+  { label: "both int8 chan 7b", det: "wa-chan7", rec: "wa-chan7" },
   { label: "det int8", det: "wa-asym", rec: "fp32" },
   { label: "rec int8", det: "fp32", rec: "wa-asym" },
   { label: "both int8", det: "wa-asym", rec: "wa-asym" },

@@ -124,7 +124,7 @@ test("PNG decoder reads both colour types", async () => {
 
 const sharedWasm = await read("src/wasm/kernels.shared.wasm");
 
-const makeOcr = async (threads?: number, recWorkers?: number) =>
+const makeOcr = async (threads?: number, recWorkers?: number, int8 = false) =>
   Ocr.create({
     det: await read("models/det.onnx"),
     rec: await read("models/rec.onnx"),
@@ -134,6 +134,7 @@ const makeOcr = async (threads?: number, recWorkers?: number) =>
     threads,
     recWorkers,
     makeRecWorker: recWorkers && recWorkers > 1 ? makeRecWorker : undefined,
+    ...(int8 ? { detCalib: await Bun.file("models/det.calib.json").text(), recCalib: await Bun.file("models/rec.calib.json").text() } : {}),
   });
 
 test("reads short upright text exactly", async () => {
@@ -319,8 +320,10 @@ test("rule characters are dropped, text with letters or digits is not", () => {
   for (const t of ["232:", "PPN ( 0)", "A", "0", "Tunai 44,900"]) expect(isSeparator(t)).toBe(false);
 });
 
-test("batched recognition agrees with one crop at a time", async () => {
-  const ocr = await makeOcr(1, 0);
+for (const int8 of [false, true]) {
+test(`batched recognition agrees with one crop at a time${int8 ? " (int8)" : ""}`, async () => {
+  const ocr = await makeOcr(1, 0, int8);
+  if (int8 && !ocr.int8) return; // engine without a signed dot product
   const img = await decodePng(await read("test/images/tilted.png"));
   const { boxes } = ocr.detect(img);
   const crops = boxes.map((b) => cropForBox(img, b));
@@ -330,3 +333,4 @@ test("batched recognition agrees with one crop at a time", async () => {
   expect(batched).toEqual(serial);
   ocr.destroy();
 }, 120_000);
+}
