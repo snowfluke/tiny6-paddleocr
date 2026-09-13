@@ -987,3 +987,169 @@ pub unsafe extern "C" fn resize_nearest(
         }
     }
 }
+
+// ---- int8 ------------------------------------------------------------------
+// Activations are int8 rows of K values (NHWC: one pixel per row), weights
+// are packed [K/4][N][4] so a 16-byte load holds four K values for four
+// output channels and one relaxed dot product does sixteen multiply-adds
+// where an FMA does four. Accumulation is i32; the epilogue applies the
+// per-channel scales in fp32, in an order the TypeScript reference repeats
+// exactly, so the test can demand bit equality without relaxed FMA.
+
+const ACT_GELU: u32 = 2;
+
+#[inline(always)]
+unsafe fn dot(a: v128, b: v128, c: v128) -> v128 {
+    i32x4_relaxed_dot_i8x16_i7x16_add(a, b, c)
+}
+
+/// y = sw[n] * (acc + comp[n]) + bias[n], act, plus the dequantized residual.
+#[inline(always)]
+unsafe fn qepilogue(
+    acc: v128,
+    j: usize,
+    sw: *const f32,
+    bias: *const f32,
+    comp: *const i32,
+    act: u32,
+    p0: f32,
+    p1: f32,
+    res: *const i8,
+    rs: *const f32,
+    rzp: *const i32,
+) -> v128 {
+    let v = i32x4_add(acc, v128_load(comp.add(j) as *const v128));
+    let mut y = f32x4_add(
+        f32x4_mul(f32x4_convert_i32x4(v), v128_load(sw.add(j) as *const v128)),
+        v128_load(bias.add(j) as *const v128),
+    );
+    if act == ACT_RELU {
+        y = f32x4_max(y, f32x4_splat(0.0));
+    } else if act == ACT_GELU {
+        y = f32x4_mul(
+            f32x4_mul(y, f32x4_splat(p1)),
+            f32x4_add(f32x4_splat(1.0), erff4(f32x4_mul(y, f32x4_splat(p0)))),
+        );
+    }
+    if !res.is_null() {
+        let r = i32x4_extend_low_i16x8(i16x8_extend_low_i8x16(v128_load32_zero(res as *const u32)));
+        let r = f32x4_convert_i32x4(i32x4_sub(r, v128_load(rzp.add(j) as *const v128)));
+        y = f32x4_add(y, f32x4_mul(r, v128_load(rs.add(j) as *const v128)));
+    }
+    y
+}
+
+/// Quantize eight fp32 values to int8 with per-channel scale and zero point.
+/// The narrowing saturates, which is the clamp.
+#[inline(always)]
+unsafe fn qstore8(lo: v128, hi: v128, j: usize, oinv: *const f32, ozp: *const i32, out: *mut i8) {
+    let q0 = i32x4_add(
+        i32x4_trunc_sat_f32x4(f32x4_nearest(f32x4_mul(lo, v128_load(oinv.add(j) as *const v128)))),
+        v128_load(ozp.add(j) as *const v128),
+    );
+    let q1 = i32x4_add(
+        i32x4_trunc_sat_f32x4(f32x4_nearest(f32x4_mul(hi, v128_load(oinv.add(j + 4) as *const v128)))),
+        v128_load(ozp.add(j + 4) as *const v128),
+    );
+    let w = i16x8_narrow_i32x4(q0, q1);
+    v128_store64_lane::<0>(i8x16_narrow_i16x8(w, w), out as *mut u64);
+}
+
+/// R rows by eight columns of the int8 product, sixteen accumulators when R = 8.
+#[inline(always)]
+unsafe fn qtile<const R: usize>(
+    mi: usize,
+    j: usize,
+    k: usize,
+    n: usize,
+    a: *const i8,
+    b: *const i8,
+    c: *mut u8,
+    sw: *const f32,
+    bias: *const f32,
+    comp: *const i32,
+    act: u32,
+    p0: f32,
+    p1: f32,
+    res: *const i8,
+    rs: *const f32,
+    rzp: *const i32,
+    oinv: *const f32,
+    ozp: *const i32,
+    out_i8: u32,
+) {
+    let mut acc_lo = [i32x4_splat(0); R];
+    let mut acc_hi = [i32x4_splat(0); R];
+    let mut kb = 0;
+    while kb < k {
+        let bp = b.add((kb / 4) * n * 4 + j * 4);
+        let b0 = v128_load(bp as *const v128);
+        let b1 = v128_load(bp.add(16) as *const v128);
+        for r in 0..R {
+            let av = v128_load32_splat(a.add((mi + r) * k + kb) as *const u32);
+            acc_lo[r] = dot(av, b0, acc_lo[r]);
+            acc_hi[r] = dot(av, b1, acc_hi[r]);
+        }
+        kb += 4;
+    }
+    for r in 0..R {
+        let row = (mi + r) * n + j;
+        let rr = if res.is_null() { res } else { res.add(row) };
+        let rr4 = if res.is_null() { res } else { rr.add(4) };
+        let lo = qepilogue(acc_lo[r], j, sw, bias, comp, act, p0, p1, rr, rs, rzp);
+        let hi = qepilogue(acc_hi[r], j + 4, sw, bias, comp, act, p0, p1, rr4, rs, rzp);
+        if out_i8 != 0 {
+            qstore8(lo, hi, j, oinv, ozp, c.add(row) as *mut i8);
+        } else {
+            let o = (c as *mut f32).add(row);
+            v128_store(o as *mut v128, lo);
+            v128_store(o.add(4) as *mut v128, hi);
+        }
+    }
+}
+
+/// Rows [lo, hi) of C = A . B on int8. k must be a multiple of 4 and n of 8;
+/// the planner routes anything else to the fp32 path. Row ranges are
+/// disjoint in C, so threads split rows.
+#[no_mangle]
+pub unsafe extern "C" fn qgemm(
+    m: usize,
+    k: usize,
+    n: usize,
+    a: *const i8,
+    b: *const i8,
+    c: *mut u8,
+    sw: *const f32,
+    bias: *const f32,
+    comp: *const i32,
+    act: u32,
+    res: *const i8,
+    rs: *const f32,
+    rzp: *const i32,
+    oinv: *const f32,
+    ozp: *const i32,
+    out_i8: u32,
+    p0: f32,
+    p1: f32,
+    lo: usize,
+    hi: usize,
+) {
+    let _ = m;
+    let mut mi = lo;
+    while mi + 8 <= hi {
+        let mut j = 0;
+        while j < n {
+            qtile::<8>(mi, j, k, n, a, b, c, sw, bias, comp, act, p0, p1, res, rs, rzp, oinv, ozp, out_i8);
+            j += 8;
+        }
+        mi += 8;
+    }
+    while mi < hi {
+        let mut j = 0;
+        while j < n {
+            qtile::<1>(mi, j, k, n, a, b, c, sw, bias, comp, act, p0, p1, res, rs, rzp, oinv, ozp, out_i8);
+            j += 8;
+        }
+        mi += 1;
+    }
+}

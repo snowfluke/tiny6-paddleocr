@@ -41,3 +41,69 @@ function channelOf(dims: number[], scales: number, axis: number): (i: number) =>
   const inner = dims.slice(axis + 1).reduce((a, b) => a * b, 1);
   return (i) => Math.floor(i / inner) % scales;
 }
+
+/**
+ * Weights for the int8 GEMM: [K][N] row-major int8 packed as [K/4][N][4], so
+ * one 16-byte load holds four K values for four output channels. K must be a
+ * multiple of 4 and N of 8; the planner pads before packing.
+ */
+export function packWeights(K: number, N: number, w: Int8Array): Int8Array {
+  if (K % 4 || N % 8 || w.length !== K * N) throw new Error(`packWeights: K=${K} N=${N} len=${w.length}`);
+  const out = new Int8Array(K * N);
+  for (let kb = 0; kb < K; kb += 4) {
+    for (let n = 0; n < N; n++) {
+      for (let t = 0; t < 4; t++) out[kb * N + n * 4 + t] = w[(kb + t) * N + n];
+    }
+  }
+  return out;
+}
+
+export type QGemmEpilogue = {
+  sw: Float32Array;
+  bias: Float32Array;
+  comp: Int32Array;
+  act: number;
+  p0?: number;
+  p1?: number;
+  res?: { q: Int8Array; scale: Float32Array; zp: Int32Array };
+  out?: { inv: Float32Array; zp: Int32Array };
+};
+
+const f = Math.fround;
+
+/**
+ * The int8 GEMM in plain arithmetic: exact i32 sums, then the epilogue in
+ * fp32 in the kernel's order. Sums of int8 products fit a double exactly, so
+ * the kernel must match this bit for bit except through GELU, whose erf
+ * polynomial only the kernel has.
+ */
+export function qgemmReference(
+  M: number, K: number, N: number, a: Int8Array, w: Int8Array, e: QGemmEpilogue,
+): Float32Array | Int8Array {
+  const y = new Float32Array(M * N);
+  for (let m = 0; m < M; m++) {
+    for (let n = 0; n < N; n++) {
+      let acc = 0;
+      for (let k = 0; k < K; k++) acc += a[m * K + k] * w[k * N + n];
+      let v = f(f(f(acc + e.comp[n]) * e.sw[n]) + e.bias[n]);
+      if (e.act === 1) v = Math.max(v, 0);
+      else if (e.act === 2) v = f(f(v * e.p1!) * f(1 + erf(f(v * e.p0!))));
+      if (e.res) v = f(v + f((e.res.q[m * N + n] - e.res.zp[n]) * e.res.scale[n]));
+      y[m * N + n] = v;
+    }
+  }
+  if (!e.out) return y;
+  const q = new Int8Array(M * N);
+  for (let i = 0; i < y.length; i++) {
+    const n = i % N;
+    const v = roundHalfEven(f(y[i] * e.out.inv[n])) + e.out.zp[n];
+    q[i] = v < -128 ? -128 : v > 127 ? 127 : v;
+  }
+  return q;
+}
+
+function erf(x: number): number {
+  const s = Math.sign(x), a = Math.abs(x);
+  const t = 1 / (1 + 0.3275911 * a);
+  return s * (1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-a * a));
+}
