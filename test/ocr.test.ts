@@ -8,7 +8,7 @@ import { cropForBox, recognizeBatch } from "../src/pipeline/recognize.ts";
 import { decodePng } from "../src/image/png.ts";
 import { parseOnnx } from "../src/onnx/parse.ts";
 import { Session } from "../src/runtime/graph.ts";
-import { dropIdentity, fuseConvEpilogue, fuseGelu } from "../src/runtime/fuse.ts";
+import { dropIdentity, foldBatchNorm, fuseConvEpilogue, fuseGelu } from "../src/runtime/fuse.ts";
 import { loadKernels, loadKernelsThreaded } from "../src/wasm/backend.ts";
 import { compare, unpack } from "../tools/check.ts";
 
@@ -73,15 +73,17 @@ for (const [which, dims] of [["det", [1, 3, 256, 256]], ["rec", [1, 3, 48, 320]]
  * a matcher that silently matches nothing would pass every other test.
  */
 const FUSIONS = [
-  // model, input dims, gelus folded, conv biases folded, relus folded, residuals
-  ["det", [1, 3, 256, 256], 13, 0, 19, 10],
-  ["rec", [1, 3, 48, 320], 10, 33, 3, 7],
+  // model, input dims, batchnorms folded, gelus folded, conv biases folded, relus folded, residuals
+  ["det", [1, 3, 256, 256], 0, 13, 0, 19, 10],
+  ["rec", [1, 3, 48, 320], 2, 10, 33, 3, 7],
 ] as const;
 
-for (const [which, dims, gelus, biases, relus, residuals] of FUSIONS) {
+for (const [which, dims, bns, gelus, biases, relus, residuals] of FUSIONS) {
   test(`fusing leaves ${which} output unchanged`, async () => {
     const g = parseOnnx(await read(`models/${which}.onnx`));
-    const afterGelu = fuseGelu(dropIdentity(g).graph);
+    const afterBn = foldBatchNorm(dropIdentity(g).graph);
+    expect(afterBn.folded).toBe(bns);
+    const afterGelu = fuseGelu(afterBn.graph);
     expect(afterGelu.fused).toBe(gelus);
     const epilogue = fuseConvEpilogue(afterGelu.graph);
     expect([epilogue.bias, epilogue.act, epilogue.residual]).toEqual([biases, relus, residuals]);

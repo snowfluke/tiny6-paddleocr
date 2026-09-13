@@ -37,6 +37,13 @@ export type Kernels = {
     res: number, rs: number, rzp: number, oinv: number, ozp: number, outI8: number,
     p0: number, p1: number, lo: number, hi: number,
   ): void;
+  qdepthwise(
+    c: number, ih: number, iw: number, oh: number, ow: number, kh: number, kw: number, sy: number, sx: number,
+    pt: number, pl: number, x: number, xzp: number, w: number, sw: number, bias: number, act: number,
+    out: number, oinv: number, ozp: number, outI8: number, lo: number, hi: number,
+  ): void;
+  qmean_channels(c: number, pixels: number, x: number, zp: number, scale: number, out: number): void;
+  qscale_channels(c: number, x: number, zp: number, scale: number, factor: number, out: number, oinv: number, ozp: number, lo: number, hi: number): void;
   quantize_nhwc(channels: number, pixels: number, x: number, out: number, inv: number, zp: number, lo: number, hi: number): void;
   dequantize_nchw(channels: number, pixels: number, q: number, out: number, scale: number, zp: number, lo: number, hi: number): void;
   transpose_f32(rows: number, cols: number, a: number, out: number): void;
@@ -219,6 +226,13 @@ export class Arena {
     } else {
       (this.k.qgemm as (...a: number[]) => void)(...args, p0, p1, 0, m);
     }
+  }
+
+  /** Output rows of the int8 depthwise convolution; args as in JOB.qdepthwise. */
+  pQDepthwise(args: number[]) {
+    const [c, , , oh, ow] = args;
+    if (this.pool && c * oh * ow >= PARALLEL_MIN) this.pool.dispatch(JOB.qdepthwise, args);
+    else (this.k.qdepthwise as (...a: number[]) => void)(...args, 0, oh);
   }
 
   /** im2col and GEMM for one strip as a single job; see JOB.convStrip. */

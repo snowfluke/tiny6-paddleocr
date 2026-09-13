@@ -107,3 +107,43 @@ function erf(x: number): number {
   const t = 1 / (1 + 0.3275911 * a);
   return s * (1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-a * a));
 }
+
+/**
+ * Depthwise int8 in plain arithmetic, the twin of qgemmReference. x is NHWC
+ * int8, w is [tap][C]; taps outside the input are skipped.
+ */
+export function qdepthwiseReference(
+  C: number, H: number, W: number, kh: number, kw: number, sy: number, sx: number, pt: number, pl: number,
+  x: Int8Array, xzp: Int32Array, w: Int8Array, sw: Float32Array, bias: Float32Array, act: number,
+  out?: { inv: Float32Array; zp: Int32Array },
+): Float32Array | Int8Array {
+  const OH = Math.floor((H + 2 * pt - kh) / sy) + 1, OW = Math.floor((W + 2 * pl - kw) / sx) + 1;
+  const y = new Float32Array(OH * OW * C);
+  for (let oy = 0; oy < OH; oy++) {
+    for (let ox = 0; ox < OW; ox++) {
+      for (let c = 0; c < C; c++) {
+        let acc = 0;
+        for (let ky = 0; ky < kh; ky++) {
+          const iy = oy * sy + ky - pt;
+          if (iy < 0 || iy >= H) continue;
+          for (let kx = 0; kx < kw; kx++) {
+            const ix = ox * sx + kx - pl;
+            if (ix < 0 || ix >= W) continue;
+            acc += (x[(iy * W + ix) * C + c] - xzp[c]) * w[(ky * kw + kx) * C + c];
+          }
+        }
+        let v = f(f(acc * sw[c]) + bias[c]);
+        if (act === 1) v = Math.max(v, 0);
+        y[(oy * OW + ox) * C + c] = v;
+      }
+    }
+  }
+  if (!out) return y;
+  const q = new Int8Array(y.length);
+  for (let i = 0; i < y.length; i++) {
+    const c = i % C;
+    const v = roundHalfEven(f(y[i] * out.inv[c])) + out.zp[c];
+    q[i] = v < -128 ? -128 : v > 127 ? 127 : v;
+  }
+  return q;
+}

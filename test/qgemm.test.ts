@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { packWeights, qgemmReference, type QGemmEpilogue } from "../src/ops/quant.ts";
+import { packWeights, qdepthwiseReference, qgemmReference, type QGemmEpilogue } from "../src/ops/quant.ts";
 
 const bytes = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
 const { instance } = await WebAssembly.instantiate(bytes, {});
@@ -75,3 +75,23 @@ test("qgemm gelu epilogue is within fp32 noise of the reference", () => {
   const want = qgemmReference(M, K, N, a, w, e) as Float32Array;
   for (let i = 0; i < got.length; i++) expect(Math.abs(got[i] - want[i])).toBeLessThan(1e-5 * (1 + Math.abs(want[i])));
 });
+
+for (const [kh, kw, s, C, H, W] of [[3, 3, 1, 16, 5, 7], [3, 3, 2, 32, 7, 9], [5, 5, 1, 16, 6, 6]]) {
+  test(`qdepthwise ${kh}x${kw} stride ${s} on ${C} channels matches the reference`, () => {
+    const pad = Math.floor(kh / 2);
+    const OH = Math.floor((H + 2 * pad - kh) / s) + 1, OW = Math.floor((W + 2 * pad - kw) / s) + 1;
+    const x = i8(H * W * C), w = i8(kh * kw * C, -127, 127);
+    const xzp = Int32Array.from({ length: C }, () => Math.floor(rnd() * 40 - 20));
+    const sw = f32(C, 0.001, 0.01), bias = f32(C, -1, 1);
+    const out = { inv: f32(C, 5, 50), zp: Int32Array.from({ length: C }, () => Math.floor(rnd() * 40 - 20)) };
+    for (const act of [0, 1]) {
+      for (const outI8 of [0, 1]) {
+        const c = put(new Uint8Array(OH * OW * C * (outI8 ? 1 : 4)));
+        k.qdepthwise(C, H, W, OH, OW, kh, kw, s, s, pad, pad, put(x), put(xzp), put(w), put(sw), put(bias), act,
+          c, put(out.inv), put(out.zp), outI8, 0, OH);
+        const got = outI8 ? new Int8Array(k.memory.buffer, c, OH * OW * C) : new Float32Array(k.memory.buffer, c, OH * OW * C);
+        same(got, qdepthwiseReference(C, H, W, kh, kw, s, s, pad, pad, x, xzp, w, sw, bias, act, outI8 ? out : undefined));
+      }
+    }
+  });
+}

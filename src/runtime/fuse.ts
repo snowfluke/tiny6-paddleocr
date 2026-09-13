@@ -98,6 +98,51 @@ export function dropIdentity(g: OnnxGraph): { graph: OnnxGraph; dropped: number 
   return alias.size ? { graph: { ...g, nodes }, dropped: alias.size } : { graph: g, dropped: 0 };
 }
 
+/**
+ * Folds a BatchNormalization that is the sole reader of a convolution into
+ * that convolution's weights and bias: w' = w * g / sqrt(v + eps),
+ * b' = (b - mean) * g / sqrt(v + eps) + beta, per output channel. The
+ * recognition export has two, on its first two convolutions, each a full
+ * pass over the widest activations in the model.
+ */
+export function foldBatchNorm(g: OnnxGraph): { graph: OnnxGraph; folded: number } {
+  const readers = readerCount(g);
+  const initializers = new Map(g.initializers);
+  const drop = new Set<OnnxNode>();
+  const rewrite = new Map<OnnxNode, OnnxNode>();
+  const f32 = (name: string): (OnnxTensor & { data: Float32Array }) | null => {
+    const t = initializers.get(name);
+    return t && t.data instanceof Float32Array ? (t as OnnxTensor & { data: Float32Array }) : null;
+  };
+  for (const conv of g.nodes) {
+    if (conv.opType !== "Conv") continue;
+    const bn = soleReader(g, readers, conv.output[0], "BatchNormalization");
+    const w = f32(conv.input[1]);
+    if (!bn || !w) continue;
+    const [gamma, beta, mean, varr] = bn.input.slice(1).map(f32);
+    if (!gamma || !beta || !mean || !varr) continue;
+    const eps = bn.attrs.get("epsilon")?.f ?? 1e-5;
+    const cout = w.dims[0];
+    const per = w.data.length / cout;
+    const wd = new Float32Array(w.data.length);
+    const bd = new Float32Array(cout);
+    const b0 = conv.input[2] ? f32(conv.input[2]) : null;
+    for (let c = 0; c < cout; c++) {
+      const k = gamma.data[c] / Math.sqrt(varr.data[c] + eps);
+      for (let i = 0; i < per; i++) wd[c * per + i] = w.data[c * per + i] * k;
+      bd[c] = ((b0 ? b0.data[c] : 0) - mean.data[c]) * k + beta.data[c];
+    }
+    const wn = `${w.name}_bn`, bname = `${conv.output[0]}_bn_bias`;
+    initializers.set(wn, { name: wn, dims: w.dims, dataType: w.dataType, data: wd });
+    initializers.set(bname, { name: bname, dims: [cout], dataType: 1, data: bd });
+    rewrite.set(conv, { ...conv, input: [conv.input[0], wn, bname], output: bn.output });
+    drop.add(bn);
+  }
+  if (!drop.size) return { graph: g, folded: 0 };
+  const nodes = g.nodes.filter((n) => !drop.has(n)).map((n) => rewrite.get(n) ?? n);
+  return { graph: { ...g, nodes, initializers }, folded: drop.size };
+}
+
 /** How many times each tensor is read, counting graph outputs as a reader. */
 function readerCount(g: OnnxGraph): Map<string, number> {
   const readers = new Map<string, number>();

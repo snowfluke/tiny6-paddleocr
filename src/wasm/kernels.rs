@@ -1225,3 +1225,147 @@ fn round_even(v: f32) -> i32 {
         t
     }
 }
+
+/// Depthwise convolution on int8 NHWC, output rows [lo, hi). Sixteen channels
+/// per step: bytes widen to i16, the zero point comes off, and the products
+/// accumulate in i32. Weights are laid out [tap][C] so each tap is one
+/// contiguous load per sixteen channels. C must be a multiple of 16.
+/// A tap outside the input contributes nothing, which is the zero point's
+/// meaning, so padding needs no fill.
+#[no_mangle]
+pub unsafe extern "C" fn qdepthwise(
+    c: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    kh: usize,
+    kw: usize,
+    sy: usize,
+    sx: usize,
+    pt: usize,
+    pl: usize,
+    x: *const i8,
+    xzp: *const i32,
+    w: *const i8,
+    sw: *const f32,
+    bias: *const f32,
+    act: u32,
+    out: *mut u8,
+    oinv: *const f32,
+    ozp: *const i32,
+    out_i8: u32,
+    lo: usize,
+    hi: usize,
+) {
+    let _ = oh;
+    for oy in lo..hi {
+        for ox in 0..ow {
+            let mut ch = 0;
+            while ch < c {
+                let zlo = i16x8_narrow_i32x4(
+                    v128_load(xzp.add(ch) as *const v128),
+                    v128_load(xzp.add(ch + 4) as *const v128),
+                );
+                let zhi = i16x8_narrow_i32x4(
+                    v128_load(xzp.add(ch + 8) as *const v128),
+                    v128_load(xzp.add(ch + 12) as *const v128),
+                );
+                let mut acc = [i32x4_splat(0); 4];
+                for ky in 0..kh {
+                    let iy = (oy * sy + ky) as isize - pt as isize;
+                    if iy < 0 || iy >= ih as isize {
+                        continue;
+                    }
+                    for kx in 0..kw {
+                        let ix = (ox * sx + kx) as isize - pl as isize;
+                        if ix < 0 || ix >= iw as isize {
+                            continue;
+                        }
+                        let xv = v128_load(x.add((iy as usize * iw + ix as usize) * c + ch) as *const v128);
+                        let wv = v128_load(w.add((ky * kw + kx) * c + ch) as *const v128);
+                        let x0 = i16x8_sub(i16x8_extend_low_i8x16(xv), zlo);
+                        let x1 = i16x8_sub(i16x8_extend_high_i8x16(xv), zhi);
+                        let w0 = i16x8_extend_low_i8x16(wv);
+                        let w1 = i16x8_extend_high_i8x16(wv);
+                        acc[0] = i32x4_add(acc[0], i32x4_extmul_low_i16x8(x0, w0));
+                        acc[1] = i32x4_add(acc[1], i32x4_extmul_high_i16x8(x0, w0));
+                        acc[2] = i32x4_add(acc[2], i32x4_extmul_low_i16x8(x1, w1));
+                        acc[3] = i32x4_add(acc[3], i32x4_extmul_high_i16x8(x1, w1));
+                    }
+                }
+                let row = (oy * ow + ox) * c + ch;
+                let mut y = [f32x4_splat(0.0); 4];
+                for h in 0..4 {
+                    let j = ch + h * 4;
+                    let mut v = f32x4_add(
+                        f32x4_mul(f32x4_convert_i32x4(acc[h]), v128_load(sw.add(j) as *const v128)),
+                        v128_load(bias.add(j) as *const v128),
+                    );
+                    if act == ACT_RELU {
+                        v = f32x4_max(v, f32x4_splat(0.0));
+                    }
+                    y[h] = v;
+                }
+                if out_i8 != 0 {
+                    qstore8(y[0], y[1], ch, oinv, ozp, (out as *mut i8).add(row));
+                    qstore8(y[2], y[3], ch + 8, oinv, ozp, (out as *mut i8).add(row + 8));
+                } else {
+                    let o = (out as *mut f32).add(row);
+                    for h in 0..4 {
+                        v128_store(o.add(h * 4) as *mut v128, y[h]);
+                    }
+                }
+                ch += 16;
+            }
+        }
+    }
+}
+
+/// Per-channel mean of an int8 NHWC tensor as fp32 [C]: the squeeze half of
+/// a squeeze-and-excite block leaves the int8 region here.
+#[no_mangle]
+pub unsafe extern "C" fn qmean_channels(c: usize, pixels: usize, x: *const i8, zp: *const i32, scale: *const f32, out: *mut f32) {
+    for ch in 0..c {
+        let mut acc: i32 = 0;
+        for p in 0..pixels {
+            acc += *x.add(p * c + ch) as i32;
+        }
+        *out.add(ch) = (acc as f32 / pixels as f32 - *zp.add(ch) as f32) * *scale.add(ch);
+    }
+}
+
+/// int8 NHWC times a per-channel fp32 factor, requantized: the excite half
+/// of squeeze-and-excite. y = (x - zp) * scale * factor -> q at the output
+/// scale. Pixels [lo, hi).
+#[no_mangle]
+pub unsafe extern "C" fn qscale_channels(
+    c: usize,
+    x: *const i8,
+    zp: *const i32,
+    scale: *const f32,
+    factor: *const f32,
+    out: *mut i8,
+    oinv: *const f32,
+    ozp: *const i32,
+    lo: usize,
+    hi: usize,
+) {
+    for p in lo..hi {
+        let mut ch = 0;
+        while ch < c {
+            let xv = v128_load(x.add(p * c + ch) as *const v128);
+            let x16 = [i16x8_extend_low_i8x16(xv), i16x8_extend_high_i8x16(xv)];
+            let mut y = [f32x4_splat(0.0); 4];
+            for h in 0..4 {
+                let j = ch + h * 4;
+                let xi = if h & 1 == 0 { i32x4_extend_low_i16x8(x16[h / 2]) } else { i32x4_extend_high_i16x8(x16[h / 2]) };
+                let d = f32x4_convert_i32x4(i32x4_sub(xi, v128_load(zp.add(j) as *const v128)));
+                y[h] = f32x4_mul(f32x4_mul(d, v128_load(scale.add(j) as *const v128)), v128_load(factor.add(j) as *const v128));
+            }
+            qstore8(y[0], y[1], ch, oinv, ozp, out.add(p * c + ch));
+            qstore8(y[2], y[3], ch + 8, oinv, ozp, out.add(p * c + ch + 8));
+            ch += 16;
+        }
+    }
+}
