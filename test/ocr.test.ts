@@ -294,6 +294,29 @@ test("the recognition pool returns exactly what the serial path does", async () 
   pooled.destroy();
 }, 180_000);
 
+/**
+ * The pool only pays from a few crops up: below that recognizeBoxesAsync
+ * falls back to the shared arena instead of one thread per crop. Both sides
+ * of that boundary must still return what the serial path returns.
+ */
+test("the pool boundary changes nothing but the wall clock", async () => {
+  const img = await decodePng(await read("test/images/receipt.png"));
+  const serial = await makeOcr(1, 0);
+  const pooled = await makeOcr(4, 4);
+  expect(pooled.recWorkers).toBe(4);
+
+  const { boxes } = serial.detect(img);
+  for (const n of [1, 3, 4, 8]) {
+    const slice = boxes.slice(0, n);
+    if (slice.length < n) continue;
+    const want = serial.recognizeBoxes(img, slice, { minConfidence: 0 });
+    const got = await pooled.recognizeBoxesAsync(img, slice, { minConfidence: 0 });
+    expect(got.map((l) => l.text)).toEqual(want.map((l) => l.text));
+  }
+  serial.destroy();
+  pooled.destroy();
+}, 180_000);
+
 test("decodes progressive and baseline JPEG to the same OCR text", async () => {
   const ocr = await makeOcr();
   const fromPng = ocr.text(await decodePng(await read("test/images/receipt.png")));
