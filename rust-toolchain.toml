@@ -1,0 +1,6 @@
+# The two .wasm kernels are committed, so every build of them must be
+# reproducible: same compiler, same bytes. CI rebuilds and fails on drift.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+targets = ["wasm32-unknown-unknown"]

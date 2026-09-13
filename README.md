@@ -119,7 +119,8 @@ Checked against `ppu-paddle-ocr` (onnxruntime + OpenCV) on the same file.
 
 ```sh
 bun install            # onnxruntime-node, dev only, for goldens and benchmarks
-bun run build          # kernels.wasm, kernels.shared.wasm, demo/tiny6.js
+bun run build          # kernels.wasm, kernels.shared.wasm (committed), demo/tiny6.js
+bun run build:web      # the bundle only; no Rust needed
 bun test               # goldens, geometry, threading, JPEG, end-to-end OCR
 bun run typecheck
 bun run ocr test/images/receipt.jpg

@@ -2,8 +2,6 @@ node_modules/
 demo/tiny6.js
 demo/models/
 demo/receipt.png
-src/wasm/kernels.wasm
-src/wasm/kernels.shared.wasm
 test/golden/*.exposed.onnx
 test/golden/*.golden.bin
 test/golden/*.input.bin

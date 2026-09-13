@@ -27,7 +27,8 @@
     "golden": "bun tools/expose.ts models/det.onnx test/golden/det.exposed.onnx && bun tools/expose.ts models/rec.onnx test/golden/rec.exposed.onnx && bun tools/golden.ts",
     "ab": "bun tools/ab.ts",
     "bench:pipeline": "bun tools/pipeline-bench.ts",
-    "deploy:demo": "bun run build && bun tools/stage-demo.ts && bunx wrangler deploy"
+    "deploy:demo": "bun run build && bun tools/stage-demo.ts && bunx wrangler deploy",
+    "build:web": "bun tools/build-web.ts"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

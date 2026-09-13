@@ -4,7 +4,8 @@
   // GitHub Pages cannot send those headers, which is why it is not used.
   // demo/models and demo/receipt.png are gitignored and staged by
   // tools/stage-demo.ts before upload. Deployed by Cloudflare's Git
-  // integration: build command `bun run build && bun tools/stage-demo.ts`,
+  // integration: build command `bun run build:web && bun tools/stage-demo.ts`; the
+  // kernels are committed, so the hosted build needs no Rust,
   // deploy command `npx wrangler deploy`. `bun run deploy:demo` is the same
   // from a logged-in machine.
   "name": "tiny6-paddleocr",

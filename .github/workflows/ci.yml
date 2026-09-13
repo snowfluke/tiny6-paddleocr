@@ -13,12 +13,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      # Version and target come from rust-toolchain.toml.
+      - run: rustup toolchain install
 
       - run: bun install --frozen-lockfile
       - run: bun run build
+      # The kernels are committed. A rebuild that differs means either the
+      # source changed without a rebuild or the compiler is not the pinned one.
+      - run: git diff --exit-code --stat -- src/wasm/kernels.wasm src/wasm/kernels.shared.wasm
       - run: bun run typecheck
 
       # The goldens are ~100 MB of ORT output and are not committed, so the
