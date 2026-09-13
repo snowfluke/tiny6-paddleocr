@@ -71,7 +71,10 @@
         (what) => status(`fetching ${what}...`),
       );
       const threads = ocr.arena.threads;
-      threadLabel = `${threads} thread${threads > 1 ? "s" : ""}, ${ocr.int8 ? "int8" : "fp32"}`;
+      const rec = ocr.recWorkers;
+      threadLabel = `${threads} thread${threads > 1 ? "s" : ""}, ` +
+        `${rec > 0 ? rec + " rec worker" + (rec > 1 ? "s" : "") : "inline rec"}, ` +
+        `${ocr.int8 ? "int8" : "fp32"}`;
       // The run status overwrites this line, so keep the thread count in the
       // stats row where it survives.
       $("stats").innerHTML = `<b>${threadLabel}</b>` +
@@ -101,7 +104,9 @@
     const t0 = performance.now();
     const { boxes } = ocr.detect(img, opts);
     const tDet = performance.now();
-    const lines = ocr.recognizeBoxes(img, boxes);
+    // The async path hands whole crops to the rec workers; without a pool it
+    // falls back to the same synchronous call.
+    const lines = await ocr.recognizeBoxesAsync(img, boxes);
     const tAll = performance.now();
 
     draw(img, boxes);

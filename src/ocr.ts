@@ -173,7 +173,15 @@ export class Ocr {
     boxes: Box[],
     filter: LineFilter = {},
   ): Promise<OcrLine[]> {
-    if (!this.recPool) return this.recognizeBoxes(img, boxes, filter);
+    // Below the crossover the shared arena wins: while a pool worker runs a
+    // whole crop on one thread, the synchronous path gives each crop all of
+    // the arena's. Measured in Chrome on the receipt, synchronous against
+    // six workers: 3 crops 19.0 ms vs 22.4, 4 crops 25.3 vs 20.7. Single
+    // threaded, one worker already beats the calling thread, so the bar is
+    // lower there.
+    if (!this.recPool || boxes.length < (this.arena.threads > 1 ? 4 : 2)) {
+      return this.recognizeBoxes(img, boxes, filter);
+    }
     const { minConfidence = DEFAULT_MIN_CONFIDENCE, dropSeparators = true } = filter;
 
     const rows = readingOrder(boxes);
