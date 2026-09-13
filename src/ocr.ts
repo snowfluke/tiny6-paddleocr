@@ -84,6 +84,11 @@ export class Ocr {
     return this.recPool?.size ?? 0;
   }
 
+  /** Whether the convolutions run on int8: calibrated, and the engine's dot product is signed. */
+  get int8(): boolean {
+    return this.det.int8Nodes > 0 || this.rec.int8Nodes > 0;
+  }
+
   /** Exposed for callers driving recognition directly, such as batching. */
   get recSession(): Session {
     return this.rec;

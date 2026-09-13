@@ -13,7 +13,7 @@ const { instance } = await WebAssembly.instantiate(wasm, {});
 const ex = Object.keys(instance.exports).sort();
 console.log(`wasm instantiates exports: ${ex.join(", ")}`);
 
-for (const need of ["gemm", "depthwise", "im2col", "heap_base", "memory"]) {
+for (const need of ["gemm", "depthwise", "im2col_strip", "qgemm", "qim2col", "dot_probe", "heap_base", "memory"]) {
   if (!ex.includes(need)) throw new Error(`missing export ${need}`);
 }
 
@@ -24,7 +24,7 @@ const base = (k.heap_base() + 15) & ~15;
 const A = base, B = A + 6 * 4, C = B + 6 * 4;
 mem().set([1, 2, 3, 4, 5, 6], A / 4);
 mem().set([7, 8, 9, 10, 11, 12], B / 4);
-k.gemm(2, 3, 2, A, B, C, 0, 0);
+k.gemm(2, 3, 2, 2, 2, A, B, C, 0, 0, 0);
 const got = Array.from(mem().slice(C / 4, C / 4 + 4));
 const want = [58, 64, 139, 154];
 console.log(`gemm 2x3*3x2      ${got.join(",")} expected ${want.join(",")} -> ${

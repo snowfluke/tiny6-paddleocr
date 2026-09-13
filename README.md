@@ -51,13 +51,28 @@ same minute:
 | ppu-paddle-ocr (onnxruntime-node + OpenCV) | **110** | 151 |
 | tiny6-paddleocr (this) | 148 (detect 66 + recognize 80) | **149** |
 
-Under load it is a tie. Idle, the native reference wins by 1.35x, and the
-arithmetic says it keeps winning: native ORT does 18.7 us per recognition
-column against our 42, and its detection graph runs in 29 ms against our 56.
-With detection at ort-web parity and recognition at its six-worker floor the
-pipeline lands near 115 ms. Beating native from WebAssembly on this machine
-is not on the table; beating onnxruntime-web is the fight that can be won,
-and it is 1.3x away.
+Under load it is a tie. Idle, the native reference wins by 1.35x, and on
+fp32 the arithmetic says it keeps winning: native ORT does 18.7 us per
+recognition column against our 42, and its detection graph runs in 29 ms
+against our 56. The fp32 ceiling is the engine (see below), not the kernel.
+
+So the convolutions run on int8. The relaxed dot product
+(`i32x4.relaxed_dot_i8x16_i7x16_add_s`) does sixteen multiply-adds in one
+instruction where an FMA does four, and the engine lowers it to one ARM
+`sdot`. Measured on the same receipt, same minute, warm minimum of six, on
+a machine with about a quarter of its cores busy:
+
+| pipeline, 720x1280 receipt | ms | vs native |
+|---|---|---|
+| ppu-paddle-ocr (onnxruntime-node, native ARM64) | 121 | 1.00x |
+| tiny6-paddleocr fp32 | 142 | 0.85x |
+| **tiny6-paddleocr int8** | **86** (detect 41 + recognize 48) | **1.41x** |
+
+Single-threaded per model, int8 against fp32: recognition 14 -> 8 ms,
+detection at 960x544 171 -> 120 ms. The GEMM alone measures 3.1-5.5x on
+the recognition shapes (`i32` accumulate, per-channel `fp32` epilogue).
+What is left in detection is the fp32 tail (transposed convolutions, the
+head) and the byte-wide passes between convolutions, which are memory-bound.
 
 Absolute numbers on a developer machine are not worth much: the same build
 measured 116 ms and 193 ms for the same work depending on what else was
@@ -115,6 +130,16 @@ Checked against `ppu-paddle-ocr` (onnxruntime + OpenCV) on the same file.
   differ by one character because the crops differ by a pixel or two.
 - The same receipt as a progressive JPEG, decoded here, yields identical text
   to the PNG.
+- int8, on 60 SROIE receipts (33,761 ground-truth characters) with the
+  calibration taken from 16 other receipts, scored by order-independent
+  token F1 because the SROIE transcripts are uppercased and split
+  inconsistently: fp32 79.13%, int8 81.00% (20 receipts worse, 39 better).
+  The difference is inside the run-to-run band, so read it as no loss, not
+  as a gain. Per-tensor activation scales lost about a point; per-channel
+  scales, which fold into the next layer's weights for free, do not. A
+  fake-quantization harness (`tools/fakequant.ts`, `tools/sroie.ts`)
+  predicted 81.01% before the kernels existed, and the kernels are pinned
+  to an integer reference bit for bit (`test/qgemm.test.ts`).
 
 ## Run it
 
@@ -254,12 +279,34 @@ Native code is not reachable from here however good the kernel gets.
 The kernel at 33-36 is about 62% of that ceiling, so a perfect GEMM is worth
 roughly 1.6x, not the 2.3x the raw ORT ratio suggests.
 
-Whether an engine turns `relaxed_madd` into one hardware instruction is not
-settled here, and the obvious microbenchmarks do not answer it: writing the
-same loop as a separate multiply and add lets the compiler hoist the
-loop-invariant multiply out, so the two are not doing equal work. What is
-measured is the kernel itself, where the fused form is neutral on the 1x1
-shapes and worth 15% on 3x3 im2col.
+JavaScriptCore does not fuse `relaxed_madd`: an accumulator sweep with two
+loads per twelve ops tops out at 2.19 instructions per cycle where the int8
+dot product reaches 3.84, which is the signature of a two-instruction
+lowering (multiply then add). That closes the question. fp32 on this engine
+is four multiply-adds on two instructions; the relaxed dot product is
+sixteen on one, and that ratio is where the int8 speed comes from.
+
+### int8
+
+Tensors inside the convolution backbone are int8 NHWC with a per-channel
+scale and zero point, calibrated once (`bun tools/calibrate.ts <images>`
+writes `models/*.calib.json`, which `Ocr.create` takes as `detCalib` and
+`recCalib`). A planner (`src/runtime/qplan.ts`) walks the fused graph and
+keeps whole regions on int8: 1x1, dense and depthwise convolutions with
+relu or gelu in the epilogue, the residual add, squeeze-and-excite, the
+FPN's add, 2x resize, concat and max-pool. Anything else gets fp32 back at
+the boundary, so the head of each model, the recognition MatMuls and the
+transposed convolutions run exactly as before. Weights are folded with the
+input channel's scale, quantized per output channel and packed
+`[K/4][N][4]` so one 16-byte load feeds the dot product; the zero points
+fold into a per-channel compensation, so the kernel is a plain dot product
+on raw bytes.
+
+The relaxed dot product only promises a 7-bit second operand. ARM engines
+lower it to `sdot` and read both operands signed; x86 engines lower it to
+`pmaddubsw` and read the second as unsigned. `Arena.signedDot` probes this
+at start-up, the way MLAS and XNNPACK do, and an engine that fails the
+probe stays on fp32 rather than being silently wrong.
 
 ### Threads
 
@@ -356,10 +403,12 @@ usually still right. Each worker now gets its own stack region from the arena.
 
 ## Not done
 
-- **A better GEMM still.** 33-36 GFLOP/s against the engine's 56.4 ceiling.
-  Worth about 1.6x on the convolutions if it were perfect, and convolutions
-  are 58% of threaded detection, so call it 1.3x end to end. Cache-tiled loops
-  with proper MR x NR blocking are the next step.
+- **int8 on x86.** The kernels want a signed dot product; on x86 engines
+  the probe fails and everything runs fp32. An `u8 x s8` variant with the
+  weights offset by 128, which is what MLAS ships, would cover it.
+- **Calibration breadth.** 16 SROIE receipts. The 6906-class recognition
+  head is fp32, but the backbone's ranges come from receipts, and other
+  documents may want their own calibration or a wider set.
 - **The recognition pool in the browser.** The demo gets detection threads but
   runs recognition serially: `src/browser.ts` has no `makeRecWorker`, which
   needs `rec-worker.ts` bundled into a second inlined blob. Node and Bun get

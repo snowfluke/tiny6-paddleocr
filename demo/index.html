@@ -64,11 +64,14 @@
     const t0 = performance.now();
     try {
       ocr = await createOcr(
-        { detUrl: "models/det.onnx", recUrl: "models/rec.onnx", dictUrl: "models/dict.txt" },
+        {
+          detUrl: "models/det.onnx", recUrl: "models/rec.onnx", dictUrl: "models/dict.txt",
+          detCalibUrl: "models/det.calib.json", recCalibUrl: "models/rec.calib.json",
+        },
         (what) => status(`fetching ${what}...`),
       );
       const threads = ocr.arena.threads;
-      threadLabel = `${threads} thread${threads > 1 ? "s" : ""}`;
+      threadLabel = `${threads} thread${threads > 1 ? "s" : ""}, ${ocr.int8 ? "int8" : "fp32"}`;
       // The run status overwrites this line, so keep the thread count in the
       // stats row where it survives.
       $("stats").innerHTML = `<b>${threadLabel}</b>` +

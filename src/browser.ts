@@ -62,6 +62,9 @@ export type WebAssets = {
   detUrl: string;
   recUrl: string;
   dictUrl: string;
+  /** Calibration JSON from tools/calibrate.ts; with both, the convolutions run on int8 where the engine allows. */
+  detCalibUrl?: string;
+  recCalibUrl?: string;
   /** Defaults to half the cores when the page is cross-origin isolated. */
   threads?: number;
 };
@@ -81,10 +84,13 @@ export async function createOcr(
     if (!r.ok) throw new Error(`${url}: ${r.status}`);
     return new Uint8Array(await r.arrayBuffer());
   };
-  const [det, rec, dict] = await Promise.all([
+  const text = async (url?: string) => (url ? new TextDecoder().decode(await fetchBytes(url)) : undefined);
+  const [det, rec, dict, detCalib, recCalib] = await Promise.all([
     fetchBytes(assets.detUrl),
     fetchBytes(assets.recUrl),
     fetchBytes(assets.dictUrl),
+    text(assets.detCalibUrl),
+    text(assets.recCalibUrl),
   ]);
   onProgress?.("kernels");
   const threaded = canUseThreads();
@@ -95,6 +101,8 @@ export async function createOcr(
     wasm: base64ToBytes(__KERNELS_B64__),
     wasmShared: threaded ? base64ToBytes(__KERNELS_SHARED_B64__) : undefined,
     threads: assets.threads ?? (threaded ? undefined : 1),
+    detCalib,
+    recCalib,
   });
 }
 
