@@ -40,14 +40,24 @@ export type Calibration = Record<string, ChannelRange>;
 export type QVal = RT | QT;
 export const isQ = (v: QVal): v is QT => "q" in v;
 
-/** Asymmetric int8 per channel. Zero stays representable, so padding is exact. */
-export function chanParams(r: ChannelRange): { scale: Float32Array; zp: Int32Array } {
+/** Which int8 the engine can take; see Arena.dotMode. */
+export type DotMode = "s8" | "u8x7";
+
+/**
+ * Asymmetric int8 per channel; zero stays representable, so padding is
+ * exact. The x86 mode uses 7 bits, [-64, 63], so its pair sums against
+ * 8-bit weights fit the engine's 16-bit intermediates. Measured on SROIE:
+ * neither costs accuracy, 7-bit weights would.
+ */
+export function chanParams(r: ChannelRange, mode: DotMode = "s8"): { scale: Float32Array; zp: Int32Array } {
   const C = r.min.length;
+  const levels = mode === "u8x7" ? 127 : 255;
+  const qmin = mode === "u8x7" ? -64 : -128;
   const scale = new Float32Array(C), zp = new Int32Array(C);
   for (let c = 0; c < C; c++) {
     const lo = Math.min(r.min[c], 0), hi = Math.max(r.max[c], 0);
-    scale[c] = Math.max(hi - lo, 1e-6) / 255;
-    zp[c] = Math.max(-128, Math.min(127, Math.round(-128 - lo / scale[c])));
+    scale[c] = Math.max(hi - lo, 1e-6) / levels;
+    zp[c] = Math.max(qmin, Math.min(qmin + levels, Math.round(qmin - lo / scale[c])));
   }
   return { scale, zp };
 }
@@ -66,7 +76,11 @@ export class QPlan {
   constructor(
     private readonly r: Resident,
     private readonly calib: Calibration,
-  ) {}
+    readonly mode: DotMode,
+  ) {
+    const [lo, hi] = mode === "u8x7" ? [-64, 63] : [-128, 127];
+    r.ar.k.set_act_range(lo, hi);
+  }
 
   /** Parameters of a tensor, uploaded on first use. */
   paramsOf(name: string): QParams {
@@ -74,7 +88,7 @@ export class QPlan {
     if (!p) {
       const range = this.calib[name];
       if (!range) throw new Error(`no calibration for ${name}`);
-      const { scale, zp } = chanParams(range);
+      const { scale, zp } = chanParams(range, this.mode);
       p = uploadQParams(this.r, scale, zp);
       this.params.set(name, p);
     }
@@ -115,8 +129,10 @@ export function buildPlan(
   calib: Calibration,
   r: Resident,
   consts: Map<string, Tensor>,
+  mode: DotMode,
 ): { graph: OnnxGraph; plan: QPlan } {
-  const plan = new QPlan(r, calib);
+  const plan = new QPlan(r, calib, mode);
+  const wzp = mode === "u8x7" ? 128 : 0;
   const readers = new Map<string, OnnxNode[]>();
   for (const n of g.nodes) for (const i of n.input) readers.set(i, [...(readers.get(i) ?? []), n]);
   const producer = new Map<string, OnnxNode>();
@@ -222,7 +238,7 @@ export function buildPlan(
         p1 = attr(gelu, "post")!.f!;
       }
       if (kind === "1x1") {
-        const q = uploadQConv(r, prepareQConv(w, bias, pin.scale, pin.zp));
+        const q = uploadQConv(r, prepareQConv(w, bias, pin.scale, pin.zp, wzp));
         const resName = n.input[3];
         // Nothing may upload once a run has started, so every parameter set
         // a handler could need is made here.
@@ -233,7 +249,7 @@ export function buildPlan(
           return [qconv1x1(r, xq, q, act, p0, p1, res, out)];
         });
       } else if (kind === "dense") {
-        const q = uploadQConv(r, prepareQConv(w, bias, pin.scale, pin.zp));
+        const q = uploadQConv(r, prepareQConv(w, bias, pin.scale, pin.zp, wzp));
         const cs = (w.dims[1] + 3) & ~3;
         plan.handlers.set(n, (x) => {
           // Pads may depend on the input size (auto_pad), so resolve per run.

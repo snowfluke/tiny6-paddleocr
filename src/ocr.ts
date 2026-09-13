@@ -106,12 +106,12 @@ export class Ocr {
 
     const recCount = a.recWorkers ?? defaultRecWorkers();
     const recPool = a.makeRecWorker && recCount > 1
-      ? await RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict, calib: arena.signedDot ? a.recCalib : undefined }, recCount)
+      ? await RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict, calib: arena.dotMode !== "none" ? a.recCalib : undefined }, recCount)
       : null;
 
-    // An engine whose dot product reads the weights as unsigned would be
-    // silently wrong on int8, so such an engine stays on fp32.
-    const int8 = (json?: string) => (json && arena.signedDot ? { int8: JSON.parse(json) } : {});
+    // An engine whose dot product lowering the probe does not recognise
+    // stays on fp32 rather than being silently wrong.
+    const int8 = (json?: string) => (json && arena.dotMode !== "none" ? { int8: JSON.parse(json) } : {});
     return new Ocr(
       new Session(parseOnnx(a.det), arena, int8(a.detCalib)),
       new Session(parseOnnx(a.rec), arena, int8(a.recCalib)),

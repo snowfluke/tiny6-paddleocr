@@ -26,6 +26,7 @@ export const JOB = {
   qresize2x: 19,
   qconcat: 20,
   qmaxpool: 21,
+  rowsum: 22,
 } as const;
 
 /** Int32 slots in the control block: 0 sequence, 1 completions, 2 op, 3+ args. */
@@ -84,6 +85,7 @@ function runShare(k, c, index, count) {
     : op === ${JOB.qresize2x} ? c[a + 4]
     : op === ${JOB.qconcat} ? c[a + 9]
     : op === ${JOB.qmaxpool} ? c[a + 1]
+    : op === ${JOB.rowsum} ? c[a + 1]
     : c[a];
   // Ranges the micro-kernels want in multiples of eight: GEMM columns, int8 GEMM rows.
   const byCols = op === ${JOB.gemm} || op === ${JOB.unary} || op === ${JOB.binary} || op === ${JOB.convStrip} || op === ${JOB.qgemm} || op === ${JOB.qconvDense};
@@ -132,19 +134,23 @@ function runBlock(k, c, op, a, index, count) {
     const [lo, hi] = share(c[a], index, count);
     if (lo < hi) k.scatter2x2(c[a + 1], c[a + 2], c[a + 3], c[a + 4], c[a + 5], c[a + 6], lo, hi);
   } else if (op === ${JOB.qgemm}) {
-    // Rows of the int8 product. Args: m k n a b c sw bias comp act res rs rzp oinv ozp out_i8, then p0 p1 as floats.
+    // Rows of the int8 product. Args: m k n a b c sw bias comp act res rs rzp oinv ozp out_i8 wzp rowsum, then p0 p1 as floats.
     const [lo, hi] = shareBy8(c[a], index, count);
-    if (lo < hi) k.qgemm(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], f[a+16], f[a+17], lo, hi);
+    if (lo < hi) k.qgemm(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], f[a+18], f[a+19], c[a+16], c[a+17], lo, hi);
+  } else if (op === ${JOB.rowsum}) {
+    // Rows. Args: k m a out.
+    const [lo, hi] = share(c[a + 1], index, count);
+    if (lo < hi) k.rowsum_i8(c[a], c[a+2], c[a+3], lo, hi);
   } else if (op === ${JOB.qconvDense}) {
     // Output pixels [lo, hi): each share builds its own rows of the column
     // matrix and multiplies them, so no share waits on another's im2col.
-    // Args: ih iw oh ow kh kw sy sx pt pl cs x zp col n b c sw bias comp act oinv ozp out_i8, then p0 p1 as floats.
+    // Args: ih iw oh ow kh kw sy sx pt pl cs x zp col rowsum n b c sw bias comp act oinv ozp out_i8 wzp, then p0 p1 as floats.
     const m = c[a + 2] * c[a + 3];
     const [lo, hi] = shareBy8(m, index, count);
     if (lo < hi) {
       const k_ = c[a + 4] * c[a + 5] * c[a + 10];
-      k.qim2col(c[a], c[a+1], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], lo, hi);
-      k.qgemm(m, k_, c[a+14], c[a+13], c[a+15], c[a+16], c[a+17], c[a+18], c[a+19], c[a+20], 0, 0, 0, c[a+21], c[a+22], c[a+23], f[a+24], f[a+25], lo, hi);
+      k.qim2col(c[a], c[a+1], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], lo, hi);
+      k.qgemm(m, k_, c[a+15], c[a+13], c[a+16], c[a+17], c[a+18], c[a+19], c[a+20], c[a+21], 0, 0, 0, c[a+22], c[a+23], c[a+24], f[a+26], f[a+27], c[a+25], c[a+14], lo, hi);
     }
   } else if (op === ${JOB.quantize}) {
     // Pixels. Args: channels cs pixels x out inv zp.

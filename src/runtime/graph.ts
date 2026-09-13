@@ -172,8 +172,9 @@ export class Session {
       // Weights upload now, before any activation, so the arena can seal the
       // boundary between what persists and what a run may recycle.
       this.res = new Resident(arena);
-      if (opts.int8) {
-        const built = buildPlan(graph, opts.int8, this.res, this.consts);
+      const mode = arena.dotMode;
+      if (opts.int8 && mode !== "none") {
+        const built = buildPlan(graph, opts.int8, this.res, this.consts, mode);
         graph = built.graph;
         this.plan = built.plan;
       }

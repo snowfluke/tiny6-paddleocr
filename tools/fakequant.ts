@@ -44,7 +44,7 @@ const gt = (await Bun.file("test/images/receipt-gt.txt").text()).trimEnd().split
 
 /** Per-tensor bounds, plus per-channel bounds along `axis` for the wa-chan mode. */
 type Range = { min: number; max: number; axis: number; cmin: Float32Array; cmax: Float32Array };
-export type Mode = "fp32" | "w" | "wa-sym" | "wa-asym" | "wa-chan" | "wa-chan7";
+export type Mode = "fp32" | "w" | "wa-sym" | "wa-asym" | "wa-chan" | "wa-chan7" | "wa-chan7a";
 
 const isGemm = (n: OnnxNode) => n.opType === "Conv" || n.opType === "MatMul";
 const isHead = (g: OnnxGraph, n: OnnxNode) => (g.initializers.get(n.input[1])?.dims.at(-1) ?? 0) > 1000;
@@ -162,16 +162,17 @@ export function quantizeGraph(g: OnnxGraph, ranges: Map<string, Range>, mode: Mo
     const x = n.input[0];
     const r = ranges.get(x);
     if (!r && mode !== "w") throw new Error(`no calibration range for ${x}`);
-    const chan = (mode === "wa-chan" || mode === "wa-chan7") && !(only && !only.has(x));
+    const chan = (mode === "wa-chan" || mode === "wa-chan7" || mode === "wa-chan7a") && !(only && !only.has(x));
+    const levels = mode === "wa-chan7a" ? 127 : 255;
     const isDepthwise = n.opType === "Conv" && (n.attrs.get("group")?.i ?? 1) > 1;
     // A depthwise weight is per channel already, so folding a per-channel
     // activation scale into it changes nothing after symmetric quantization.
-    initializers.set(w.name, fakeQuantWeight(w, n.opType, chan && !isDepthwise ? chanScales(r!)[0] : undefined, mode === "wa-chan7" && !isDepthwise));
+    initializers.set(w.name, fakeQuantWeight(w, n.opType, chan && !isDepthwise ? chanScales(r!, levels)[0] : undefined, mode === "wa-chan7" && !isDepthwise));
     if (mode === "w" || (only && !only.has(x))) { nodes.push(n); continue; }
     if (!dq.has(x)) {
       const sym = mode === "wa-sym";
       const [scale, zp] = chan
-        ? chanScales(r!)
+        ? chanScales(r!, levels)
         : sym
         ? [[Math.max(Math.abs(r!.min), Math.abs(r!.max)) / 127], [0]]
         : [[(r!.max - r!.min) / 255], [Math.round(-128 - r!.min / ((r!.max - r!.min) / 255))]];
@@ -187,14 +188,19 @@ export function quantizeGraph(g: OnnxGraph, ranges: Map<string, Range>, mode: Mo
   return { ...g, nodes, initializers };
 }
 
-/** Asymmetric int8 scale and zero point per channel from the calibrated bounds. */
-function chanScales(r: Range): [Float32Array, Float32Array] {
+/**
+ * Asymmetric int8 scale and zero point per channel from the calibrated
+ * bounds. `levels` 127 gives 7-bit activations in [-64, 63], which lets an
+ * x86 engine take 8-bit weights without saturating its 16-bit pair sums.
+ */
+function chanScales(r: Range, levels = 255): [Float32Array, Float32Array] {
   const C = r.cmin.length;
   const scale = new Float32Array(C), zp = new Float32Array(C);
+  const qmin = levels === 255 ? -128 : -64;
   for (let c = 0; c < C; c++) {
     const lo = Math.min(r.cmin[c], 0), hi = Math.max(r.cmax[c], 0);
-    scale[c] = Math.max(hi - lo, 1e-6) / 255;
-    zp[c] = Math.max(-128, Math.min(127, Math.round(-128 - lo / scale[c])));
+    scale[c] = Math.max(hi - lo, 1e-6) / levels;
+    zp[c] = Math.max(qmin, Math.min(qmin + levels, Math.round(qmin - lo / scale[c])));
   }
   return [scale, zp];
 }

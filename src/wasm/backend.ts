@@ -35,8 +35,10 @@ export type Kernels = {
     m: number, k: number, n: number, a: number, b: number, c: number,
     sw: number, bias: number, comp: number, act: number,
     res: number, rs: number, rzp: number, oinv: number, ozp: number, outI8: number,
-    p0: number, p1: number, lo: number, hi: number,
+    p0: number, p1: number, wzp: number, rowsum: number, lo: number, hi: number,
   ): void;
+  rowsum_i8(k: number, a: number, out: number, lo: number, hi: number): void;
+  set_act_range(lo: number, hi: number): void;
   qdepthwise(
     c: number, ih: number, iw: number, oh: number, ow: number, kh: number, kw: number, sy: number, sx: number,
     pt: number, pl: number, x: number, xzp: number, w: number, sw: number, bias: number, act: number,
@@ -48,7 +50,7 @@ export type Kernels = {
   quantize_nhwc(channels: number, cs: number, pixels: number, x: number, out: number, inv: number, zp: number, lo: number, hi: number): void;
   qim2col(
     ih: number, iw: number, ow: number, kh: number, kw: number, sy: number, sx: number, pt: number, pl: number,
-    cs: number, x: number, zp: number, col: number, lo: number, hi: number,
+    cs: number, x: number, zp: number, col: number, rowsum: number, lo: number, hi: number,
   ): void;
   dequantize_nchw(channels: number, pixels: number, q: number, out: number, scale: number, zp: number, lo: number, hi: number): void;
   transpose_f32(rows: number, cols: number, a: number, out: number, lo: number, hi: number): void;
@@ -181,9 +183,15 @@ export class Arena {
     return this.pool?.count ?? 1;
   }
 
-  /** Whether the engine's relaxed dot product is signed on both operands, which the int8 kernels need. */
-  get signedDot(): boolean {
-    return this.k.dot_probe() === -512;
+  /**
+   * How the engine reads the relaxed dot product's weight operand: "s8"
+   * (ARM sdot, full int8 weights), "u8x7" (x86 pmaddubsw: weights offset by
+   * 128, activations 7-bit), or "none" (basic build, or unknown lowering),
+   * which keeps the engine on fp32.
+   */
+  get dotMode(): "s8" | "u8x7" | "none" {
+    const p = this.k.dot_probe();
+    return p === -512 ? "s8" : p === 512 ? "u8x7" : "none";
   }
 
   /** Dispatches where a share ran over a millisecond late, and the time spent waiting for them. */
@@ -236,10 +244,17 @@ export class Arena {
   pQGemm(args: number[], p0: number, p1: number) {
     const [m, , n] = args;
     if (this.pool && m * n >= PARALLEL_MIN) {
-      this.pool.dispatch(JOB.qgemm, args, { 16: p0, 17: p1 });
+      this.pool.dispatch(JOB.qgemm, args, { 18: p0, 19: p1 });
     } else {
-      (this.k.qgemm as (...a: number[]) => void)(...args, p0, p1, 0, m);
+      const [, , , , , , , , , , , , , , , , wzp, rowsum] = args;
+      (this.k.qgemm as (...a: number[]) => void)(...args.slice(0, 16), p0, p1, wzp, rowsum, 0, m);
     }
+  }
+
+  /** Byte sums of int8 rows, for the x86 weight-offset correction. */
+  pRowsum(k: number, m: number, a: number, out: number) {
+    if (this.pool && m * k >= PARALLEL_MIN) this.pool.dispatch(JOB.rowsum, [k, m, a, out]);
+    else this.k.rowsum_i8(k, a, out, 0, m);
   }
 
   // The int8 region's edges and its byte-wide passes, split by pixel.
@@ -287,13 +302,13 @@ export class Arena {
 
   /** im2col and int8 GEMM for a dense convolution, split by output pixel; args as in JOB.qconvDense. */
   pQConvDense(args: number[], p0: number, p1: number) {
-    const [, , oh, ow, kh, kw, , , , , cs, x, zp, col, n, b, c, sw, bias, comp, act, oinv, ozp, outI8] = args;
+    const [, , oh, ow, kh, kw, , , , , cs, x, zp, col, rowsum, n, b, c, sw, bias, comp, act, oinv, ozp, outI8, wzp] = args;
     const m = oh * ow, k = kh * kw * cs;
     if (this.pool && m * n >= PARALLEL_MIN) {
-      this.pool.dispatch(JOB.qconvDense, args, { 24: p0, 25: p1 });
+      this.pool.dispatch(JOB.qconvDense, args, { 26: p0, 27: p1 });
     } else {
-      this.k.qim2col(args[0], args[1], ow, kh, kw, args[6], args[7], args[8], args[9], cs, x, zp, col, 0, m);
-      this.k.qgemm(m, k, n, col, b, c, sw, bias, comp, act, 0, 0, 0, oinv, ozp, outI8, p0, p1, 0, m);
+      this.k.qim2col(args[0], args[1], ow, kh, kw, args[6], args[7], args[8], args[9], cs, x, zp, col, rowsum, 0, m);
+      this.k.qgemm(m, k, n, col, b, c, sw, bias, comp, act, 0, 0, 0, oinv, ozp, outI8, p0, p1, wzp, rowsum, 0, m);
     }
   }
 

@@ -1003,6 +1003,23 @@ pub unsafe extern "C" fn resize_nearest(
 
 const ACT_GELU: u32 = 2;
 
+/// Activation byte range. 8-bit by default; the x86 mode narrows it to
+/// [-64, 63] so pair sums against 8-bit weights fit the engine's 16-bit
+/// intermediates. Lives in linear memory, so one call covers every worker.
+static mut ACT_LO: i8 = -128;
+static mut ACT_HI: i8 = 127;
+
+#[no_mangle]
+pub unsafe extern "C" fn set_act_range(lo: i32, hi: i32) {
+    ACT_LO = lo as i8;
+    ACT_HI = hi as i8;
+}
+
+#[inline(always)]
+unsafe fn clamp_act(v: v128) -> v128 {
+    i8x16_max(i8x16_min(v, i8x16_splat(ACT_HI)), i8x16_splat(ACT_LO))
+}
+
 #[inline(always)]
 unsafe fn dot(a: v128, b: v128, c: v128) -> v128 {
     #[cfg(target_feature = "relaxed-simd")]
@@ -1019,10 +1036,13 @@ unsafe fn dot(a: v128, b: v128, c: v128) -> v128 {
     }
 }
 
-/// y = sw[n] * (acc + comp[n]) + bias[n], act, plus the dequantized residual.
+/// y = sw[n] * (acc - wzp * rowsum + comp[n]) + bias[n], act, plus the
+/// dequantized residual. `wzp` is the offset the weights were stored with
+/// (0 on a signed-dot engine, 128 on x86) and `rowsum` this row's byte sum.
 #[inline(always)]
 unsafe fn qepilogue(
     acc: v128,
+    rowfix: v128,
     j: usize,
     sw: *const f32,
     bias: *const f32,
@@ -1034,7 +1054,7 @@ unsafe fn qepilogue(
     rs: *const f32,
     rzp: *const i32,
 ) -> v128 {
-    let v = i32x4_add(acc, v128_load(comp.add(j) as *const v128));
+    let v = i32x4_add(i32x4_sub(acc, rowfix), v128_load(comp.add(j) as *const v128));
     let mut y = f32x4_add(
         f32x4_mul(f32x4_convert_i32x4(v), v128_load(sw.add(j) as *const v128)),
         v128_load(bias.add(j) as *const v128),
@@ -1068,7 +1088,7 @@ unsafe fn qstore8(lo: v128, hi: v128, j: usize, oinv: *const f32, ozp: *const i3
         v128_load(ozp.add(j + 4) as *const v128),
     );
     let w = i16x8_narrow_i32x4(q0, q1);
-    v128_store64_lane::<0>(i8x16_narrow_i16x8(w, w), out as *mut u64);
+    v128_store64_lane::<0>(clamp_act(i8x16_narrow_i16x8(w, w)), out as *mut u64);
 }
 
 /// R rows by eight columns of the int8 product, sixteen accumulators when R = 8.
@@ -1093,6 +1113,8 @@ unsafe fn qtile<const R: usize>(
     oinv: *const f32,
     ozp: *const i32,
     out_i8: u32,
+    wzp: i32,
+    rowsum: *const i32,
 ) {
     let mut acc_lo = [i32x4_splat(0); R];
     let mut acc_hi = [i32x4_splat(0); R];
@@ -1112,8 +1134,9 @@ unsafe fn qtile<const R: usize>(
         let row = (mi + r) * n + j;
         let rr = if res.is_null() { res } else { res.add(row) };
         let rr4 = if res.is_null() { res } else { rr.add(4) };
-        let lo = qepilogue(acc_lo[r], j, sw, bias, comp, act, p0, p1, rr, rs, rzp);
-        let hi = qepilogue(acc_hi[r], j + 4, sw, bias, comp, act, p0, p1, rr4, rs, rzp);
+        let rowfix = if wzp == 0 { i32x4_splat(0) } else { i32x4_splat(wzp * *rowsum.add(mi + r)) };
+        let lo = qepilogue(acc_lo[r], rowfix, j, sw, bias, comp, act, p0, p1, rr, rs, rzp);
+        let hi = qepilogue(acc_hi[r], rowfix, j + 4, sw, bias, comp, act, p0, p1, rr4, rs, rzp);
         if out_i8 != 0 {
             qstore8(lo, hi, j, oinv, ozp, c.add(row) as *mut i8);
         } else {
@@ -1147,6 +1170,8 @@ pub unsafe extern "C" fn qgemm(
     out_i8: u32,
     p0: f32,
     p1: f32,
+    wzp: i32,
+    rowsum: *const i32,
     lo: usize,
     hi: usize,
 ) {
@@ -1155,7 +1180,7 @@ pub unsafe extern "C" fn qgemm(
     while mi + 8 <= hi {
         let mut j = 0;
         while j < n {
-            qtile::<8>(mi, j, k, n, a, b, c, sw, bias, comp, act, p0, p1, res, rs, rzp, oinv, ozp, out_i8);
+            qtile::<8>(mi, j, k, n, a, b, c, sw, bias, comp, act, p0, p1, res, rs, rzp, oinv, ozp, out_i8, wzp, rowsum);
             j += 8;
         }
         mi += 8;
@@ -1163,11 +1188,37 @@ pub unsafe extern "C" fn qgemm(
     while mi < hi {
         let mut j = 0;
         while j < n {
-            qtile::<1>(mi, j, k, n, a, b, c, sw, bias, comp, act, p0, p1, res, rs, rzp, oinv, ozp, out_i8);
+            qtile::<1>(mi, j, k, n, a, b, c, sw, bias, comp, act, p0, p1, res, rs, rzp, oinv, ozp, out_i8, wzp, rowsum);
             j += 8;
         }
         mi += 1;
     }
+}
+
+/// Sum of each int8 row's bytes as i32, rows [lo, hi). The x86 mode's
+/// weight offset is corrected with this in the GEMM epilogue.
+#[no_mangle]
+pub unsafe extern "C" fn rowsum_i8(k: usize, a: *const i8, out: *mut i32, lo: usize, hi: usize) {
+    for r in lo..hi {
+        *out.add(r) = sum_bytes(a.add(r * k), k);
+    }
+}
+
+#[inline(always)]
+unsafe fn sum_bytes(p: *const i8, k: usize) -> i32 {
+    let mut acc = i32x4_splat(0);
+    let mut i = 0;
+    while i + 16 <= k {
+        acc = i32x4_add(acc, i32x4_extadd_pairwise_i16x8(i16x8_extadd_pairwise_i8x16(v128_load(p.add(i) as *const v128))));
+        i += 16;
+    }
+    let mut s = i32x4_extract_lane::<0>(acc) + i32x4_extract_lane::<1>(acc)
+        + i32x4_extract_lane::<2>(acc) + i32x4_extract_lane::<3>(acc);
+    while i < k {
+        s += *p.add(i) as i32;
+        i += 1;
+    }
+    s
 }
 
 /// NCHW fp32 to NHWC int8 with a per-channel scale and zero point, for
@@ -1190,9 +1241,10 @@ pub unsafe extern "C" fn quantize_nhwc(
         let s = *inv.add(c);
         let z = *zp.add(c);
         let src = x.add(c * pixels);
+        let (alo, ahi) = (ACT_LO as i32, ACT_HI as i32);
         for p in lo..hi {
             let mut q = round_even(*src.add(p) * s) + z;
-            if q < -128 { q = -128 } else if q > 127 { q = 127 }
+            if q < alo { q = alo } else if q > ahi { q = ahi }
             *out.add(p * cs + c) = q as i8;
         }
     }
@@ -1415,6 +1467,7 @@ pub unsafe extern "C" fn qim2col(
     x: *const i8,
     zp: *const i32,
     col: *mut i8,
+    rowsum: *mut i32,
     lo: usize,
     hi: usize,
 ) {
@@ -1437,6 +1490,9 @@ pub unsafe extern "C" fn qim2col(
                     core::ptr::copy_nonoverlapping(src, dst, cs);
                 }
             }
+        }
+        if !rowsum.is_null() {
+            *rowsum.add(p) = sum_bytes(row, k);
         }
     }
 }
@@ -1577,11 +1633,12 @@ pub unsafe extern "C" fn qmaxpool2x2same(c: usize, h: usize, w: usize, x: *const
     }
 }
 
-/// The relaxed dot product only promises a 7-bit second operand; the int8
-/// kernels feed it full int8 weights and rely on the engine lowering to a
-/// signed dot (ARM SDOT). This returns -512 where that holds and +512 where
-/// the engine treats the operand as unsigned (x86 pmaddubsw), so the
-/// runtime can keep such an engine on fp32. Same probe MLAS and XNNPACK use.
+/// The relaxed dot product only promises a 7-bit second operand. This
+/// returns -512 where the engine reads it signed (ARM SDOT: full int8
+/// weights, 8-bit activations) and +512 where it reads it unsigned (x86
+/// pmaddubsw: weights stored offset by 128, activations 7-bit, row-sum
+/// correction). Anything else keeps the engine on fp32. Same probe MLAS and
+/// XNNPACK use.
 #[no_mangle]
 pub unsafe extern "C" fn dot_probe() -> i32 {
     #[cfg(not(target_feature = "relaxed-simd"))]

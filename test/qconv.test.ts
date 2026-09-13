@@ -7,9 +7,11 @@ import { dequantizeFromQ, prepareQConv, qconv1x1, qconvDense, qdepthwise, quanti
 import type { Tensor } from "../src/runtime/tensor.ts";
 
 import { wasm } from "./kernels.ts";
-// See qgemm.test.ts: the GEMM-backed convolutions need the signed dot product.
-const signedDot = (await loadKernels(wasm)).signedDot;
-const dotTest = test.skipIf(!signedDot);
+// See qgemm.test.ts: the GEMM-backed convolutions run in the engine's dot
+// mode, with the x86 weight offset when that is what it has.
+const mode = (await loadKernels(wasm)).dotMode;
+const wzp = mode === "u8x7" ? 128 : 0;
+const dotTest = test.skipIf(mode === "none");
 
 let seed = 3;
 const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
@@ -20,11 +22,12 @@ const tensor = (dims: number[], lo: number, hi: number): Tensor =>
 function calibrate(t: Tensor) {
   const [, C, H, W] = t.dims;
   const scale = new Float32Array(C), zp = new Int32Array(C);
+  const levels = wzp ? 127 : 255, qmin = wzp ? -64 : -128;
   for (let c = 0; c < C; c++) {
     let lo = 0, hi = 0;
     for (let i = 0; i < H * W; i++) { const v = t.data[c * H * W + i]; lo = Math.min(lo, v); hi = Math.max(hi, v); }
-    scale[c] = (hi - lo) / 255 || 1;
-    zp[c] = Math.round(-128 - lo / scale[c]);
+    scale[c] = (hi - lo) / levels || 1;
+    zp[c] = Math.round(qmin - lo / scale[c]);
   }
   return { scale, zp };
 }
@@ -41,14 +44,14 @@ dotTest("int8 1x1 conv equals the integer reference and tracks the fp32 conv", a
   const arena = await loadKernels(wasm);
   const r = new Resident(arena);
   const xp = uploadQParams(r, xq.scale, xq.zp);
-  const q = uploadQConv(r, prepareQConv(w, bias, xq.scale, xq.zp));
+  const q = uploadQConv(r, prepareQConv(w, bias, xq.scale, xq.zp, wzp));
   const xr = quantizeToQ(r, r.upload(x), xp);
 
   // The same integer inputs through the TypeScript reference, rows = pixels.
   const a = new Int8Array(H * W * Cin);
   arena.readBytesInto(xr.ptr, a);
   const wq = new Int8Array(q.K * q.N);
-  for (let kb = 0; kb < q.K; kb += 4) for (let n = 0; n < q.N; n++) for (let t = 0; t < 4; t++) wq[(kb + t) * q.N + n] = q.packed[kb * q.N + n * 4 + t];
+  for (let kb = 0; kb < q.K; kb += 4) for (let n = 0; n < q.N; n++) for (let t = 0; t < 4; t++) wq[(kb + t) * q.N + n] = (q.packed[kb * q.N + n * 4 + t] - wzp) << 24 >> 24;
   const want = qgemmReference(H * W, q.K, q.N, a, wq, { sw: q.sw, bias: q.bias, comp: q.comp, act: 1 }) as Float32Array;
 
   const y = qconv1x1(r, xr, q, 1, 0, 0, null, null) as { ptr: number; dims: number[]; len: number };
@@ -79,7 +82,7 @@ dotTest("int8 output round-trips through dequantize within one step", async () =
   const arena = await loadKernels(wasm);
   const r = new Resident(arena);
   const xp = uploadQParams(r, xq.scale, xq.zp);
-  const q = uploadQConv(r, prepareQConv(w, null, xq.scale, xq.zp));
+  const q = uploadQConv(r, prepareQConv(w, null, xq.scale, xq.zp, wzp));
   const xr = quantizeToQ(r, r.upload(x), xp);
   const f32 = r.download(qconv1x1(r, xr, q, 0, 0, 0, null, null) as never);
   const oq = calibrate(f32);
@@ -129,7 +132,7 @@ for (const [Cin, Cout, H, W, k, s, pad] of [[3, 16, 9, 11, 3, 2, 1], [32, 16, 8,
     const arena = await loadKernels(wasm);
     const r = new Resident(arena);
     const xp = uploadQParams(r, xq.scale, xq.zp);
-    const q = uploadQConv(r, prepareQConv(w, bias, xq.scale, xq.zp));
+    const q = uploadQConv(r, prepareQConv(w, bias, xq.scale, xq.zp, wzp));
     const cs = (Cin + 3) & ~3;
     const xr = quantizeToQ(r, r.upload(x), xp, cs);
     const geom = { kh: k, kw: k, sy: s, sx: s, pt: pad, pl: pad, pb: pad, pr: pad };

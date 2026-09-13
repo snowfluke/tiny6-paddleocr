@@ -31,6 +31,8 @@ export type QConvWeights = {
   K: number;
   N: number;
   packed: Int8Array;
+  /** Offset the stored weights carry: 0 on a signed-dot engine, 128 on x86. */
+  wzp: number;
   /** Per output channel: dequant scale, bias, and the zero-point compensation. */
   sw: Float32Array;
   bias: Float32Array;
@@ -46,7 +48,7 @@ export type QConvWeights = {
  * comp[n] = -sum_k Wq[k,n] * zp[c(k)], which is what makes the kernel a plain
  * dot product on the raw int8 values.
  */
-export function prepareQConv(w: Tensor, bias: Float32Array | null, inScale: Float32Array, inZp: Int32Array): QConvWeights {
+export function prepareQConv(w: Tensor, bias: Float32Array | null, inScale: Float32Array, inZp: Int32Array, wzp = 0): QConvWeights {
   const [Cout, Cin, kh, kw] = w.dims;
   // Input channels pad to a multiple of four with zero weights; the tensor
   // side pads to the same stride (see QT.cs).
@@ -76,7 +78,10 @@ export function prepareQConv(w: Tensor, bias: Float32Array | null, inScale: Floa
     }
     comp[n] = acc;
   }
-  return { K, N, packed: packWeights(K, N, wq), sw, bias: bias ?? new Float32Array(N), comp };
+  // An engine that reads the weight operand as unsigned gets w + 128 as
+  // bytes; the GEMM epilogue takes 128 * (row sum) back off.
+  if (wzp) for (let i = 0; i < wq.length; i++) wq[i] = (wq[i] + wzp) << 24 >> 24;
+  return { K, N, packed: packWeights(K, N, wq), wzp, sw, bias: bias ?? new Float32Array(N), comp };
 }
 
 /** The packed weights and epilogue vectors, uploaded once. */
@@ -114,23 +119,30 @@ export function qconv1x1(
   const M = H * W, N = w.N;
   const rs = residual ? residual.q.ptr.scale : 0;
   const rzp = residual ? residual.q.ptr.zp : 0;
+  const rowsum = w.wzp ? r.ar.allocScratch(M) : 0;
+  const rows = (b: number) => {
+    if (rowsum) r.ar.pRowsum(w.K, M, x.ptr + b * M * x.cs, rowsum);
+    return rowsum;
+  };
   // Batch items are independent; each runs at its own offset.
   if (out) {
     const y = allocQ(r, [B, N, H, W], out);
     for (let b = 0; b < B; b++) {
       r.ar.pQGemm([M, w.K, N, x.ptr + b * M * x.cs, w.ptr.packed, y.ptr + b * M * N, w.ptr.sw, w.ptr.bias, w.ptr.comp, act,
-        residual ? residual.ptr + b * M * N : 0, rs, rzp, out.ptr.inv, out.ptr.zp, 1], p0, p1);
+        residual ? residual.ptr + b * M * N : 0, rs, rzp, out.ptr.inv, out.ptr.zp, 1, w.wzp, rows(b)], p0, p1);
     }
+    if (rowsum) r.ar.release(rowsum);
     return y;
   }
   const tmp = r.alloc([M, N]);
   const y = r.alloc([B, N, H, W]);
   for (let b = 0; b < B; b++) {
     r.ar.pQGemm([M, w.K, N, x.ptr + b * M * x.cs, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act,
-      residual ? residual.ptr + b * M * N : 0, rs, rzp, 0, 0, 0], p0, p1);
+      residual ? residual.ptr + b * M * N : 0, rs, rzp, 0, 0, 0, w.wzp, rows(b)], p0, p1);
     r.ar.pTranspose(M, N, tmp.ptr, y.ptr + b * M * N * 4);
   }
   r.ar.release(tmp.ptr);
+  if (rowsum) r.ar.release(rowsum);
   return y;
 }
 
@@ -159,23 +171,25 @@ export function qconvDense(
   const M = OH * OW, N = w.N;
   if (g.kh * g.kw * x.cs !== w.K) throw new Error(`qconvDense: K ${g.kh * g.kw * x.cs} but weights have ${w.K}`);
   const col = r.ar.allocScratch((M * w.K + 3) >> 2);
-  const geom = (b: number) => [H, W, OH, OW, g.kh, g.kw, g.sy, g.sx, g.pt, g.pl, x.cs, x.ptr + b * H * W * x.cs, x.q.ptr.zp, col];
+  const rowsum = w.wzp ? r.ar.allocScratch(M) : 0;
+  const geom = (b: number) => [H, W, OH, OW, g.kh, g.kw, g.sy, g.sx, g.pt, g.pl, x.cs, x.ptr + b * H * W * x.cs, x.q.ptr.zp, col, rowsum];
   let y: QT | RT;
   if (out) {
     y = allocQ(r, [B, N, OH, OW], out);
     for (let b = 0; b < B; b++) {
-      r.ar.pQConvDense([...geom(b), N, w.ptr.packed, y.ptr + b * M * N, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, out.ptr.inv, out.ptr.zp, 1], p0, p1);
+      r.ar.pQConvDense([...geom(b), N, w.ptr.packed, y.ptr + b * M * N, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, out.ptr.inv, out.ptr.zp, 1, w.wzp], p0, p1);
     }
   } else {
     const tmp = r.alloc([M, N]);
     y = r.alloc([B, N, OH, OW]);
     for (let b = 0; b < B; b++) {
-      r.ar.pQConvDense([...geom(b), N, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, 0, 0, 0], p0, p1);
+      r.ar.pQConvDense([...geom(b), N, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, 0, 0, 0, w.wzp], p0, p1);
       r.ar.pTranspose(M, N, tmp.ptr, y.ptr + b * M * N * 4);
     }
     r.ar.release(tmp.ptr);
   }
   r.ar.release(col);
+  if (rowsum) r.ar.release(rowsum);
   return y;
 }
 
