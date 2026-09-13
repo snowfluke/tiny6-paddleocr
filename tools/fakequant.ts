@@ -15,7 +15,7 @@
 import { Ocr } from "../src/ocr.ts";
 import { Session } from "../src/runtime/graph.ts";
 import { type OnnxGraph, type OnnxNode, type OnnxTensor, parseOnnx } from "../src/onnx/parse.ts";
-import { decodePng } from "../src/image/png.ts";
+import { decodePng, type RGBA } from "../src/image/png.ts";
 import { DEFAULT_DETECT } from "../src/pipeline/detect.ts";
 import type { Tensor } from "../src/runtime/tensor.ts";
 
@@ -40,13 +40,15 @@ const reference = (await Bun.file("test/images/receipt-reference.txt").text()).t
 const gt = (await Bun.file("test/images/receipt-gt.txt").text()).trimEnd().split("\n");
 
 type Range = { min: number; max: number };
-type Mode = "fp32" | "w" | "wa-sym" | "wa-asym";
+export type Mode = "fp32" | "w" | "wa-sym" | "wa-asym";
 
 const isGemm = (n: OnnxNode) => n.opType === "Conv" || n.opType === "MatMul";
 const isHead = (g: OnnxGraph, n: OnnxNode) => (g.initializers.get(n.input[1])?.dims.at(-1) ?? 0) > 1000;
 
 /** Run the pipeline once with fp32 sessions and record min/max of every tensor a GEMM reads. */
-export async function calibrate(): Promise<{ det: Map<string, Range>; rec: Map<string, Range> }> {
+export type Calibration = { det: Map<string, Range>; rec: Map<string, Range> };
+
+export async function calibrate(images?: RGBA[], clip = pct): Promise<Calibration> {
   const ocr = await Ocr.create({ ...assets, det: await read("models/det.onnx"), rec: await read("models/rec.onnx") });
   const out = { det: new Map<string, Range>(), rec: new Map<string, Range>() };
   // Percentile clipping needs the values, so keep a strided sample per tensor.
@@ -61,7 +63,7 @@ export async function calibrate(): Promise<{ det: Map<string, Range>; rec: Map<s
       for (const v of t.data) { if (v < lo) lo = v; if (v > hi) hi = v; }
       const r = ranges.get(name) ?? { min: Infinity, max: -Infinity };
       ranges.set(name, { min: Math.min(r.min, lo), max: Math.max(r.max, hi) });
-      const step = Math.max(1, Math.floor(t.data.length / 65536));
+      const step = Math.max(1, Math.floor(t.data.length / 16384));
       const pick = new Float32Array(Math.ceil(t.data.length / step));
       for (let i = 0, j = 0; i < t.data.length; i += step) pick[j++] = t.data[i];
       samples[which].set(name, [...(samples[which].get(name) ?? []), pick]);
@@ -72,18 +74,16 @@ export async function calibrate(): Promise<{ det: Map<string, Range>; rec: Map<s
       return run(feeds, { ...opts, onNode: (n, outs) => outs.forEach((t, i) => note(n.output[i], t)) });
     };
   }
-  for (const name of calibImages) {
-    const img = await decodePng(await read(`test/images/${name}.png`));
-    ocr.text(img, DEFAULT_DETECT, { minConfidence: 0, dropSeparators: false });
-  }
+  images ??= await Promise.all(calibImages.map(async (name) => decodePng(await read(`test/images/${name}.png`))));
+  for (const img of images) ocr.text(img, DEFAULT_DETECT, { minConfidence: 0, dropSeparators: false });
   ocr.destroy();
-  if (pct < 100) {
+  if (clip < 100) {
     for (const which of ["det", "rec"] as const) {
       for (const [name, parts] of samples[which]) {
         const all = new Float32Array(parts.reduce((n, p) => n + p.length, 0));
         for (let i = 0, o = 0; i < parts.length; o += parts[i++].length) all.set(parts[i], o);
         all.sort();
-        const tail = (all.length - 1) * (1 - pct / 100);
+        const tail = (all.length - 1) * (1 - clip / 100);
         out[which].set(name, { min: all[Math.floor(tail)], max: all[Math.ceil(all.length - 1 - tail)] });
       }
     }
@@ -154,12 +154,17 @@ function editDistance(a: string, b: string): number {
 
 const cer = (got: string[], want: string[]) => editDistance(got.join("\n"), want.join("\n")) / want.join("\n").length;
 
-export async function evaluate(detMode: Mode, recMode: Mode, cal: Awaited<ReturnType<typeof calibrate>>, only?: Set<string>) {
-  // Weights must upload before any run, so each configuration gets a fresh arena.
+/** Weights must upload before any run, so each configuration gets a fresh arena. */
+export async function quantizedOcr(detMode: Mode, recMode: Mode, cal: Calibration, only?: Set<string>): Promise<Ocr> {
   const ocr = await Ocr.create({ ...assets, det: await read("models/det.onnx"), rec: await read("models/rec.onnx") });
   const o = ocr as unknown as Record<string, Session>;
   o.det = new Session(quantizeGraph(detGraph, cal.det, detMode), ocr.arena);
   o.rec = new Session(quantizeGraph(recGraph, cal.rec, recMode, only), ocr.arena);
+  return ocr;
+}
+
+export async function evaluate(detMode: Mode, recMode: Mode, cal: Calibration, only?: Set<string>) {
+  const ocr = await quantizedOcr(detMode, recMode, cal, only);
   const all = ocr.text(receipt, DEFAULT_DETECT, { minConfidence: 0, dropSeparators: false }).split("\n");
   const kept = ocr.text(receipt).split("\n");
   ocr.destroy();
