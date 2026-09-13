@@ -15,6 +15,7 @@ export const JOB = {
   softmax: 7,
   affine: 8,
   convStrip: 10,
+  qgemm: 11,
 } as const;
 
 /** Int32 slots in the control block: 0 sequence, 1 completions, 2 op, 3+ args. */
@@ -65,7 +66,8 @@ function runShare(k, c, index, count) {
     : op === ${JOB.binary} ? c[a + 2]
     : op === ${JOB.convStrip} ? c[a + 13]
     : c[a];
-  const byCols = op === ${JOB.gemm} || op === ${JOB.unary} || op === ${JOB.binary} || op === ${JOB.convStrip};
+  // Ranges the micro-kernels want in multiples of eight: GEMM columns, int8 GEMM rows.
+  const byCols = op === ${JOB.gemm} || op === ${JOB.unary} || op === ${JOB.binary} || op === ${JOB.convStrip} || op === ${JOB.qgemm};
   const blocks = count === 1 ? 1 : Math.max(1, Math.min(${BLOCKS_PER_THREAD} * count, byCols ? Math.floor(total / 8) : total));
   for (;;) {
     const i = count === 1 ? 0 : Atomics.add(c, ${CLAIM}, 1);
@@ -110,6 +112,10 @@ function runBlock(k, c, op, a, index, count) {
   } else if (op === ${JOB.scatter2x2}) {
     const [lo, hi] = share(c[a], index, count);
     if (lo < hi) k.scatter2x2(c[a + 1], c[a + 2], c[a + 3], c[a + 4], c[a + 5], c[a + 6], lo, hi);
+  } else if (op === ${JOB.qgemm}) {
+    // Rows of the int8 product. Args: m k n a b c sw bias comp act res rs rzp oinv ozp out_i8, then p0 p1 as floats.
+    const [lo, hi] = shareBy8(c[a], index, count);
+    if (lo < hi) k.qgemm(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], f[a+16], f[a+17], lo, hi);
   }
 }
 `;

@@ -31,6 +31,15 @@ export type Kernels = {
     a: number, b: number, out: number,
   ): void;
   unary(op: number, n: number, a: number, out: number, p0: number, p1: number): void;
+  qgemm(
+    m: number, k: number, n: number, a: number, b: number, c: number,
+    sw: number, bias: number, comp: number, act: number,
+    res: number, rs: number, rzp: number, oinv: number, ozp: number, outI8: number,
+    p0: number, p1: number, lo: number, hi: number,
+  ): void;
+  quantize_nhwc(channels: number, pixels: number, x: number, out: number, inv: number, zp: number, lo: number, hi: number): void;
+  dequantize_nchw(channels: number, pixels: number, q: number, out: number, scale: number, zp: number, lo: number, hi: number): void;
+  transpose_f32(rows: number, cols: number, a: number, out: number): void;
   reduce_mean(outer: number, inner: number, a: number, out: number): void;
   maxpool2x2(planes: number, h: number, w: number, a: number, out: number, lo: number, hi: number): void;
   affine_channels(
@@ -202,6 +211,16 @@ export class Arena {
     }
   }
 
+  /** Rows of the int8 GEMM; see JOB.qgemm for the argument order. */
+  pQGemm(args: number[], p0: number, p1: number) {
+    const [m, , n] = args;
+    if (this.pool && m * n >= PARALLEL_MIN) {
+      this.pool.dispatch(JOB.qgemm, args, { 16: p0, 17: p1 });
+    } else {
+      (this.k.qgemm as (...a: number[]) => void)(...args, p0, p1, 0, m);
+    }
+  }
+
   /** im2col and GEMM for one strip as a single job; see JOB.convStrip. */
   pConvStrip(args: number[]) {
     const [cin, ih, iw, ow, kh, kw, sy, sx, pt, pl, dy, dx, p0, width, x, col, m, k, w, cbase, bias, act, ldc] = args;
@@ -326,6 +345,22 @@ export class Arena {
 
   write(ptr: number, a: Float32Array) {
     new Float32Array(this.mem, ptr, a.length).set(a);
+  }
+
+  /** Byte-level twins of persist and write for the int8 path. */
+  persistBytes(a: Uint8Array | Int8Array | Int32Array): number {
+    if (this.scratchBase >= 0) throw new Error("persist() after seal(): weights must upload first");
+    const ptr = this.alloc((a.byteLength + 3) >> 2);
+    this.writeBytes(ptr, a);
+    return ptr;
+  }
+
+  writeBytes(ptr: number, a: Uint8Array | Int8Array | Int32Array) {
+    new Uint8Array(this.mem, ptr, a.byteLength).set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength));
+  }
+
+  readBytesInto(ptr: number, a: Uint8Array | Int8Array) {
+    a.set(new Uint8Array(this.mem, ptr, a.byteLength) as never);
   }
 
   /**

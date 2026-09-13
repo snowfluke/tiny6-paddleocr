@@ -1153,3 +1153,75 @@ pub unsafe extern "C" fn qgemm(
         mi += 1;
     }
 }
+
+/// NCHW fp32 to NHWC int8 with a per-channel scale and zero point, for
+/// pixels [lo, hi). This is the entry into the int8 region.
+#[no_mangle]
+pub unsafe extern "C" fn quantize_nhwc(
+    channels: usize,
+    pixels: usize,
+    x: *const f32,
+    out: *mut i8,
+    inv: *const f32,
+    zp: *const i32,
+    lo: usize,
+    hi: usize,
+) {
+    for c in 0..channels {
+        let s = *inv.add(c);
+        let z = *zp.add(c);
+        let src = x.add(c * pixels);
+        for p in lo..hi {
+            let mut q = round_even(*src.add(p) * s) + z;
+            if q < -128 { q = -128 } else if q > 127 { q = 127 }
+            *out.add(p * channels + c) = q as i8;
+        }
+    }
+}
+
+/// NHWC int8 back to NCHW fp32 for pixels [lo, hi). The exit from the int8 region.
+#[no_mangle]
+pub unsafe extern "C" fn dequantize_nchw(
+    channels: usize,
+    pixels: usize,
+    q: *const i8,
+    out: *mut f32,
+    scale: *const f32,
+    zp: *const i32,
+    lo: usize,
+    hi: usize,
+) {
+    for c in 0..channels {
+        let s = *scale.add(c);
+        let z = *zp.add(c);
+        let dst = out.add(c * pixels);
+        for p in lo..hi {
+            *dst.add(p) = (*q.add(p * channels + c) as i32 - z) as f32 * s;
+        }
+    }
+}
+
+/// [rows][cols] to [cols][rows]; the fp32 output of an int8 conv is NHWC.
+#[no_mangle]
+pub unsafe extern "C" fn transpose_f32(rows: usize, cols: usize, a: *const f32, out: *mut f32) {
+    for r in 0..rows {
+        for c in 0..cols {
+            *out.add(c * rows + r) = *a.add(r * cols + c);
+        }
+    }
+}
+
+/// Round half to even, as f32x4.nearest does, so the scalar and vector
+/// quantizers agree with each other and with the TypeScript reference.
+#[inline(always)]
+fn round_even(v: f32) -> i32 {
+    let t = v as i32;
+    let frac = v - t as f32;
+    if frac > 0.5 || (frac == 0.5 && t & 1 != 0) {
+        t + 1
+    } else if frac < -0.5 || (frac == -0.5 && t & 1 != 0) {
+        t - 1
+    } else {
+        t
+    }
+}
