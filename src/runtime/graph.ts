@@ -71,7 +71,7 @@ const padsDependOnInput = (n: OnnxNode) => {
   return ap !== "NOTSET" && ap !== "VALID";
 };
 
-function convAttrs(n: OnnxNode, x: { dims: number[] }, kernelFrom: number[]): ConvAttrs {
+export function convAttrs(n: OnnxNode, x: { dims: number[] }, kernelFrom: number[]): ConvAttrs {
   const hit = convAttrCache.get(n);
   if (hit) return hit;
   const built = buildConvAttrs(n, x, kernelFrom);
@@ -194,6 +194,10 @@ export class Session {
     return this.plan?.handlers.size ?? 0;
   }
 
+  planned(n: OnnxNode): boolean {
+    return this.plan?.handlers.has(n) ?? false;
+  }
+
   run(feeds: Record<string, Tensor>, opts: RunOptions = {}): Map<string, Tensor> {
     if (this.res) return this.runResident(this.res, feeds, opts);
     return this.runTs(feeds, opts);
@@ -201,6 +205,7 @@ export class Session {
 
   private runResident(r: Resident, feeds: Record<string, Tensor>, opts: RunOptions): Map<string, Tensor> {
     r.ar.beginRun();
+    this.plan?.beginRun();
     const env = new Map<string, QVal>(this.residentConsts);
     for (const [k, v] of Object.entries(feeds)) {
       const rt = r.upload(v);

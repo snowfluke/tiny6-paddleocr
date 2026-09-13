@@ -1155,10 +1155,13 @@ pub unsafe extern "C" fn qgemm(
 }
 
 /// NCHW fp32 to NHWC int8 with a per-channel scale and zero point, for
-/// pixels [lo, hi). This is the entry into the int8 region.
+/// pixels [lo, hi). This is the entry into the int8 region. `cs` is the
+/// channel stride of a row; channels past `channels` are zero, which lets a
+/// 3-channel image feed a kernel that reads channels four at a time.
 #[no_mangle]
 pub unsafe extern "C" fn quantize_nhwc(
     channels: usize,
+    cs: usize,
     pixels: usize,
     x: *const f32,
     out: *mut i8,
@@ -1174,7 +1177,12 @@ pub unsafe extern "C" fn quantize_nhwc(
         for p in lo..hi {
             let mut q = round_even(*src.add(p) * s) + z;
             if q < -128 { q = -128 } else if q > 127 { q = 127 }
-            *out.add(p * channels + c) = q as i8;
+            *out.add(p * cs + c) = q as i8;
+        }
+    }
+    for c in channels..cs {
+        for p in lo..hi {
+            *out.add(p * cs + c) = 0;
         }
     }
 }
@@ -1201,10 +1209,11 @@ pub unsafe extern "C" fn dequantize_nchw(
     }
 }
 
-/// [rows][cols] to [cols][rows]; the fp32 output of an int8 conv is NHWC.
+/// [rows][cols] to [cols][rows] for rows [lo, hi); the fp32 output of an
+/// int8 conv is NHWC and the fp32 graph wants NCHW.
 #[no_mangle]
-pub unsafe extern "C" fn transpose_f32(rows: usize, cols: usize, a: *const f32, out: *mut f32) {
-    for r in 0..rows {
+pub unsafe extern "C" fn transpose_f32(rows: usize, cols: usize, a: *const f32, out: *mut f32, lo: usize, hi: usize) {
+    for r in lo..hi {
         for c in 0..cols {
             *out.add(c * rows + r) = *a.add(r * cols + c);
         }
@@ -1366,6 +1375,188 @@ pub unsafe extern "C" fn qscale_channels(
             qstore8(y[0], y[1], ch, oinv, ozp, out.add(p * c + ch));
             qstore8(y[2], y[3], ch + 8, oinv, ozp, out.add(p * c + ch + 8));
             ch += 16;
+        }
+    }
+}
+
+/// im2col on int8 NHWC for output pixels [lo, hi): row p of `col` holds the
+/// kh*kw taps of pixel p, each tap `cs` channel bytes, in (ky, kx, c) order
+/// so the packed weights of a dense convolution can use the same K order. A
+/// tap outside the input gets the channel's zero point, which is what fp32
+/// zero padding means after quantization.
+#[no_mangle]
+pub unsafe extern "C" fn qim2col(
+    ih: usize,
+    iw: usize,
+    ow: usize,
+    kh: usize,
+    kw: usize,
+    sy: usize,
+    sx: usize,
+    pt: usize,
+    pl: usize,
+    cs: usize,
+    x: *const i8,
+    zp: *const i32,
+    col: *mut i8,
+    lo: usize,
+    hi: usize,
+) {
+    let k = kh * kw * cs;
+    for p in lo..hi {
+        let oy = p / ow;
+        let ox = p % ow;
+        let row = col.add(p * k);
+        for ky in 0..kh {
+            let iy = (oy * sy + ky) as isize - pt as isize;
+            for kx in 0..kw {
+                let ix = (ox * sx + kx) as isize - pl as isize;
+                let dst = row.add((ky * kw + kx) * cs);
+                if iy < 0 || iy >= ih as isize || ix < 0 || ix >= iw as isize {
+                    for c in 0..cs {
+                        *dst.add(c) = *zp.add(c) as i8;
+                    }
+                } else {
+                    let src = x.add((iy as usize * iw + ix as usize) * cs);
+                    core::ptr::copy_nonoverlapping(src, dst, cs);
+                }
+            }
+        }
+    }
+}
+
+// ---- int8 glue: the ops between convolutions, so tensors stay bytes -------
+
+/// Requantize sixteen bytes from one per-channel scale to another:
+/// y = (x - zx) * sx * oinv + zo, rounded and saturated. `ch` is the channel of
+/// the first lane in the source vectors and `och` in the output vectors.
+#[inline(always)]
+unsafe fn requant16(
+    xv: v128, ch: usize, zx: *const i32, sx: *const f32, och: usize, oinv: *const f32, ozp: *const i32, out: *mut i8,
+) {
+    let x16 = [i16x8_extend_low_i8x16(xv), i16x8_extend_high_i8x16(xv)];
+    let mut y = [f32x4_splat(0.0); 4];
+    for h in 0..4 {
+        let j = ch + h * 4;
+        let xi = if h & 1 == 0 { i32x4_extend_low_i16x8(x16[h / 2]) } else { i32x4_extend_high_i16x8(x16[h / 2]) };
+        let d = f32x4_convert_i32x4(i32x4_sub(xi, v128_load(zx.add(j) as *const v128)));
+        y[h] = f32x4_mul(d, v128_load(sx.add(j) as *const v128));
+    }
+    qstore8(y[0], y[1], och, oinv, ozp, out);
+    qstore8(y[2], y[3], och + 8, oinv, ozp, out.add(8));
+}
+
+/// Two int8 NHWC tensors of one shape added into a third, pixels [lo, hi).
+/// C must be a multiple of 16.
+#[no_mangle]
+pub unsafe extern "C" fn qadd(
+    c: usize,
+    a: *const i8,
+    azp: *const i32,
+    ascale: *const f32,
+    b: *const i8,
+    bzp: *const i32,
+    bscale: *const f32,
+    out: *mut i8,
+    oinv: *const f32,
+    ozp: *const i32,
+    lo: usize,
+    hi: usize,
+) {
+    for p in lo..hi {
+        let mut ch = 0;
+        while ch < c {
+            let av = v128_load(a.add(p * c + ch) as *const v128);
+            let bv = v128_load(b.add(p * c + ch) as *const v128);
+            let a16 = [i16x8_extend_low_i8x16(av), i16x8_extend_high_i8x16(av)];
+            let b16 = [i16x8_extend_low_i8x16(bv), i16x8_extend_high_i8x16(bv)];
+            let mut y = [f32x4_splat(0.0); 4];
+            for h in 0..4 {
+                let j = ch + h * 4;
+                let ai = if h & 1 == 0 { i32x4_extend_low_i16x8(a16[h / 2]) } else { i32x4_extend_high_i16x8(a16[h / 2]) };
+                let bi = if h & 1 == 0 { i32x4_extend_low_i16x8(b16[h / 2]) } else { i32x4_extend_high_i16x8(b16[h / 2]) };
+                let da = f32x4_mul(f32x4_convert_i32x4(i32x4_sub(ai, v128_load(azp.add(j) as *const v128))), v128_load(ascale.add(j) as *const v128));
+                let db = f32x4_mul(f32x4_convert_i32x4(i32x4_sub(bi, v128_load(bzp.add(j) as *const v128))), v128_load(bscale.add(j) as *const v128));
+                y[h] = f32x4_add(da, db);
+            }
+            qstore8(y[0], y[1], ch, oinv, ozp, out.add(p * c + ch));
+            qstore8(y[2], y[3], ch + 8, oinv, ozp, out.add(p * c + ch + 8));
+            ch += 16;
+        }
+    }
+}
+
+/// Nearest-neighbour 2x upsample of int8 NHWC (asymmetric, floor): output
+/// rows [lo, hi), each a copy of input row oy/2 with every pixel doubled.
+#[no_mangle]
+pub unsafe extern "C" fn qresize2x(c: usize, iw: usize, x: *const i8, out: *mut i8, lo: usize, hi: usize) {
+    let ow = iw * 2;
+    for oy in lo..hi {
+        let src = x.add((oy / 2) * iw * c);
+        let dst = out.add(oy * ow * c);
+        for ix in 0..iw {
+            core::ptr::copy_nonoverlapping(src.add(ix * c), dst.add(2 * ix * c), c);
+            core::ptr::copy_nonoverlapping(src.add(ix * c), dst.add((2 * ix + 1) * c), c);
+        }
+    }
+}
+
+/// Copy an int8 NHWC tensor with `cin` channels into channel offset `off` of
+/// one with `cout` channels, requantizing to the output's scale. Pixels [lo, hi).
+/// cin must be a multiple of 16.
+#[no_mangle]
+pub unsafe extern "C" fn qconcat_in(
+    cin: usize,
+    cout: usize,
+    off: usize,
+    x: *const i8,
+    zx: *const i32,
+    sx: *const f32,
+    out: *mut i8,
+    oinv: *const f32,
+    ozp: *const i32,
+    lo: usize,
+    hi: usize,
+) {
+    for p in lo..hi {
+        let mut ch = 0;
+        while ch < cin {
+            let xv = v128_load(x.add(p * cin + ch) as *const v128);
+            requant16(xv, ch, zx, sx, off + ch, oinv, ozp, out.add(p * cout + off + ch));
+            ch += 16;
+        }
+    }
+}
+
+/// 2x2 max pool, stride 1, SAME_UPPER (one pad row and column at the far
+/// side), on int8 NHWC. Output rows [lo, hi). Max commutes with the affine
+/// dequantization, so the bytes are compared directly and keep their scale.
+#[no_mangle]
+pub unsafe extern "C" fn qmaxpool2x2same(c: usize, h: usize, w: usize, x: *const i8, out: *mut i8, lo: usize, hi: usize) {
+    for y in lo..hi {
+        let y1 = if y + 1 < h { y + 1 } else { y };
+        for xx in 0..w {
+            let x1 = if xx + 1 < w { xx + 1 } else { xx };
+            let p00 = x.add((y * w + xx) * c);
+            let p01 = x.add((y * w + x1) * c);
+            let p10 = x.add((y1 * w + xx) * c);
+            let p11 = x.add((y1 * w + x1) * c);
+            let dst = out.add((y * w + xx) * c);
+            let mut ch = 0;
+            while ch + 16 <= c {
+                let m = i8x16_max(
+                    i8x16_max(v128_load(p00.add(ch) as *const v128), v128_load(p01.add(ch) as *const v128)),
+                    i8x16_max(v128_load(p10.add(ch) as *const v128), v128_load(p11.add(ch) as *const v128)),
+                );
+                v128_store(dst.add(ch) as *mut v128, m);
+                ch += 16;
+            }
+            while ch < c {
+                let a = *p00.add(ch); let b = *p01.add(ch); let d = *p10.add(ch); let e = *p11.add(ch);
+                let mut m = a; if b > m { m = b } if d > m { m = d } if e > m { m = e }
+                *dst.add(ch) = m;
+                ch += 1;
+            }
         }
     }
 }

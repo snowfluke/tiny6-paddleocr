@@ -18,7 +18,11 @@ const arena = process.argv.includes("--wasm")
     )
     : await loadKernels(new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer()))
   : undefined;
-const s = new Session(g, arena);
+const int8 = process.argv.includes("--int8") && arena
+  ? { int8: JSON.parse(await Bun.file(`models/${which}.calib.json`).text()) }
+  : {};
+const s = new Session(g, arena, int8);
+if (s.int8Nodes) console.log(`${s.int8Nodes} nodes on int8`);
 const feeds = { [g.inputs[0].name]: { dims, data: new Float32Array(n).fill(0.25) } };
 s.run(feeds);
 
@@ -28,15 +32,17 @@ const t0 = last;
 s.run(feeds, {
   onNodeDone: (node) => {
     const now = performance.now();
-    const e = byOp.get(node.opType) ?? { ms: 0, n: 0 };
+    const label = s.planned(node) ? `${node.opType} (int8)` : node.opType;
+    const e = byOp.get(label) ?? { ms: 0, n: 0 };
     e.ms += now - last;
     e.n++;
-    byOp.set(node.opType, e);
+    byOp.set(label, e);
     last = now;
   },
 });
 const total = performance.now() - t0;
-console.log(`${which} total ${total.toFixed(0)} ms, ${threads} thread(s)`);
+const stalls = arena?.stalls;
+console.log(`${which} total ${total.toFixed(0)} ms, ${threads} thread(s)${stalls?.count ? `, ${stalls.count} late shares (${stalls.ms.toFixed(0)} ms)` : ""}`);
 for (const [op, e] of [...byOp].sort((a, b) => b[1].ms - a[1].ms)) {
   if (e.ms < 1) continue;
   console.log(`  ${op.padEnd(20)} ${e.ms.toFixed(0).padStart(6)} ms  ${String(e.n).padStart(3)}x  ${((e.ms / total) * 100).toFixed(1)}%`);

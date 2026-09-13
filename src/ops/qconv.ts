@@ -19,8 +19,12 @@ export function uploadQParams(r: Resident, scale: Float32Array, zp: Int32Array):
   return { scale, zp, ptr: { scale: r.ar.persist(scale), inv: r.ar.persist(inv), zp: r.ar.persistBytes(zp) } };
 }
 
-/** An int8 NHWC activation in the arena: `dims` stay NCHW for the graph's sake. */
-export type QT = { dims: number[]; ptr: number; bytes: number; q: QParams };
+/**
+ * An int8 NHWC activation in the arena: `dims` stay NCHW for the graph's
+ * sake. `cs` is the channel stride of a pixel, equal to C except for a
+ * boundary tensor padded so a dense kernel can read channels four at a time.
+ */
+export type QT = { dims: number[]; ptr: number; bytes: number; cs: number; q: QParams };
 
 /** Everything a Conv needs after its weights have been folded and quantized. */
 export type QConvWeights = {
@@ -44,13 +48,16 @@ export type QConvWeights = {
  */
 export function prepareQConv(w: Tensor, bias: Float32Array | null, inScale: Float32Array, inZp: Int32Array): QConvWeights {
   const [Cout, Cin, kh, kw] = w.dims;
-  if (Cin % 4 || Cout % 8) throw new Error(`prepareQConv: Cin=${Cin} Cout=${Cout} need Cin%4==0 and Cout%8==0`);
-  const K = kh * kw * Cin, N = Cout;
+  // Input channels pad to a multiple of four with zero weights; the tensor
+  // side pads to the same stride (see QT.cs).
+  const cs = (Cin + 3) & ~3;
+  if (Cout % 8) throw new Error(`prepareQConv: Cout=${Cout} must be a multiple of 8`);
+  const K = kh * kw * cs, N = Cout;
   const folded = new Float32Array(K * N);
   for (let n = 0; n < Cout; n++) {
     for (let c = 0; c < Cin; c++) {
       for (let t = 0; t < kh * kw; t++) {
-        folded[(t * Cin + c) * N + n] = w.data[(n * Cin + c) * kh * kw + t] * inScale[c];
+        folded[(t * cs + c) * N + n] = w.data[(n * Cin + c) * kh * kw + t] * inScale[c];
       }
     }
   }
@@ -65,7 +72,7 @@ export function prepareQConv(w: Tensor, bias: Float32Array | null, inScale: Floa
     for (let k = 0; k < K; k++) {
       const q = roundHalfEven(folded[k * N + n] / s);
       wq[k * N + n] = q;
-      acc -= q * inZp[k % Cin];
+      if (k % cs < Cin) acc -= q * inZp[k % cs];
     }
     comp[n] = acc;
   }
@@ -88,9 +95,9 @@ export function uploadQConv(r: Resident, q: QConvWeights): QConvResident {
 }
 
 /** Allocate an int8 NHWC tensor; the arena counts floats, so round the bytes up. */
-export function allocQ(r: Resident, dims: number[], q: QParams): QT {
-  const bytes = dims.reduce((a, b) => a * b, 1);
-  return { dims, ptr: r.ar.allocScratch((bytes + 3) >> 2), bytes, q };
+export function allocQ(r: Resident, dims: number[], q: QParams, cs = dims[1]): QT {
+  const bytes = dims[0] * cs * dims[2] * dims[3];
+  return { dims, ptr: r.ar.allocScratch((bytes + 3) >> 2), bytes, cs, q };
 }
 
 /**
@@ -102,9 +109,9 @@ export function qconv1x1(
   r: Resident, x: QT, w: QConvResident, act: number, p0: number, p1: number,
   residual: QT | null, out: QParams | null,
 ): QT | RT {
-  const [n, Cin, H, W] = x.dims;
+  const [n, , H, W] = x.dims;
   if (n !== 1) throw new Error("qconv1x1: batch 1 only");
-  if (Cin !== w.K) throw new Error(`qconv1x1: Cin ${Cin} but K ${w.K}`);
+  if (x.cs !== w.K) throw new Error(`qconv1x1: channel stride ${x.cs} but K ${w.K}`);
   const M = H * W, N = w.N;
   const rptr = residual ? residual.ptr : 0;
   const rs = residual ? residual.q.ptr.scale : 0;
@@ -119,42 +126,74 @@ export function qconv1x1(
   r.ar.pQGemm([M, w.K, N, x.ptr, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act,
     rptr, rs, rzp, 0, 0, 0], p0, p1);
   const y = r.alloc([1, N, H, W]);
-  r.ar.k.transpose_f32(M, N, tmp.ptr, y.ptr);
+  r.ar.pTranspose(M, N, tmp.ptr, y.ptr);
   r.ar.release(tmp.ptr);
   return y;
 }
 
 /** fp32 NCHW in the arena to int8 NHWC at the given per-channel scale. */
-export function quantizeToQ(r: Resident, x: RT, p: QParams): QT {
-  const [, C, H, W] = x.dims;
-  const q = allocQ(r, x.dims, p);
-  r.ar.k.quantize_nhwc(C, H * W, x.ptr, q.ptr, p.ptr.inv, p.ptr.zp, 0, H * W);
+export function quantizeToQ(r: Resident, x: RT, p: QParams, cs = x.dims[1]): QT {
+  const [N, C, H, W] = x.dims;
+  const q = allocQ(r, x.dims, p, cs);
+  for (let n = 0; n < N; n++) {
+    r.ar.pQuantize(C, cs, H * W, x.ptr + n * C * H * W * 4, q.ptr + n * cs * H * W, p.ptr.inv, p.ptr.zp);
+  }
   return q;
 }
 
+export type DenseGeom = { kh: number; kw: number; sy: number; sx: number; pt: number; pl: number; pb: number; pr: number };
+
+/**
+ * Dense convolution of any kernel size: int8 im2col into a scratch column
+ * matrix, then the int8 GEMM, both split by output pixel. Batch 1.
+ */
+export function qconvDense(
+  r: Resident, x: QT, w: QConvResident, g: DenseGeom, act: number, p0: number, p1: number, out: QParams | null,
+): QT | RT {
+  const [n, , H, W] = x.dims;
+  if (n !== 1) throw new Error("qconvDense: batch 1 only");
+  const OH = Math.floor((H + g.pt + g.pb - g.kh) / g.sy) + 1;
+  const OW = Math.floor((W + g.pl + g.pr - g.kw) / g.sx) + 1;
+  const M = OH * OW, N = w.N;
+  if (g.kh * g.kw * x.cs !== w.K) throw new Error(`qconvDense: K ${g.kh * g.kw * x.cs} but weights have ${w.K}`);
+  const col = r.ar.allocScratch((M * w.K + 3) >> 2);
+  const geom = [H, W, OH, OW, g.kh, g.kw, g.sy, g.sx, g.pt, g.pl, x.cs, x.ptr, x.q.ptr.zp, col];
+  let y: QT | RT;
+  if (out) {
+    y = allocQ(r, [1, N, OH, OW], out);
+    r.ar.pQConvDense([...geom, N, w.ptr.packed, y.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, out.ptr.inv, out.ptr.zp, 1], p0, p1);
+  } else {
+    const tmp = r.alloc([M, N]);
+    r.ar.pQConvDense([...geom, N, w.ptr.packed, tmp.ptr, w.ptr.sw, w.ptr.bias, w.ptr.comp, act, 0, 0, 0], p0, p1);
+    y = r.alloc([1, N, OH, OW]);
+    r.ar.pTranspose(M, N, tmp.ptr, y.ptr);
+    r.ar.release(tmp.ptr);
+  }
+  r.ar.release(col);
+  return y;
+}
+
 export function dequantizeFromQ(r: Resident, q: QT): RT {
-  const [, C, H, W] = q.dims;
+  const [N, C, H, W] = q.dims;
+  if (q.cs !== C) throw new Error("dequantizeFromQ: padded tensors are read by their convolution only");
   const y = r.alloc(q.dims);
-  r.ar.k.dequantize_nchw(C, H * W, q.ptr, y.ptr, q.q.ptr.scale, q.q.ptr.zp, 0, H * W);
+  for (let n = 0; n < N; n++) {
+    r.ar.pDequantize(C, H * W, q.ptr + n * C * H * W, y.ptr + n * C * H * W * 4, q.q.ptr.scale, q.q.ptr.zp);
+  }
   return y;
 }
 
 // ---- depthwise ---------------------------------------------------------------
 
-export type DwResident = {
-  kh: number; kw: number; sy: number; sx: number; pt: number; pl: number;
-  ptr: { w: number; sw: number; bias: number };
-};
+export type DwResident = { kh: number; kw: number; ptr: { w: number; sw: number; bias: number } };
+export type DwGeom = { sy: number; sx: number; pt: number; pl: number; pb: number; pr: number };
 
 /**
  * Per-channel symmetric int8 of a [C,1,kh,kw] weight laid out [tap][C]. The
  * kernel sums wq * (xq - zp), so the dequant scale is the weight's times the
  * input's, per channel.
  */
-export function uploadDepthwise(
-  r: Resident, w: Tensor, bias: Float32Array | null, geom: { sy: number; sx: number; pt: number; pl: number },
-  inScale: Float32Array,
-): DwResident {
+export function uploadDepthwise(r: Resident, w: Tensor, bias: Float32Array | null, inScale: Float32Array): DwResident {
   const [C, , kh, kw] = w.dims;
   const taps = kh * kw;
   const wq = new Int8Array(taps * C), sw = new Float32Array(C);
@@ -166,20 +205,20 @@ export function uploadDepthwise(
     for (let t = 0; t < taps; t++) wq[t * C + c] = roundHalfEven(w.data[c * taps + t] / s);
   }
   return {
-    kh, kw, ...geom,
+    kh, kw,
     ptr: { w: r.ar.persistBytes(wq), sw: r.ar.persist(sw), bias: r.ar.persist(bias ?? new Float32Array(C)) },
   };
 }
 
-export function qdepthwise(r: Resident, x: QT, d: DwResident, act: number, out: QParams | null): QT | RT {
+export function qdepthwise(r: Resident, x: QT, d: DwResident, g: DwGeom, act: number, out: QParams | null): QT | RT {
   const [N, C, H, W] = x.dims;
-  const OH = Math.floor((H + 2 * d.pt - d.kh) / d.sy) + 1;
-  const OW = Math.floor((W + 2 * d.pl - d.kw) / d.sx) + 1;
+  const OH = Math.floor((H + g.pt + g.pb - d.kh) / g.sy) + 1;
+  const OW = Math.floor((W + g.pl + g.pr - d.kw) / g.sx) + 1;
   const plane = OH * OW;
   if (out) {
     const y = allocQ(r, [N, C, OH, OW], out);
     for (let n = 0; n < N; n++) {
-      r.ar.pQDepthwise([C, H, W, OH, OW, d.kh, d.kw, d.sy, d.sx, d.pt, d.pl, x.ptr + n * C * H * W, x.q.ptr.zp,
+      r.ar.pQDepthwise([C, H, W, OH, OW, d.kh, d.kw, g.sy, g.sx, g.pt, g.pl, x.ptr + n * C * H * W, x.q.ptr.zp,
         d.ptr.w, d.ptr.sw, d.ptr.bias, act, y.ptr + n * C * plane, out.ptr.inv, out.ptr.zp, 1]);
     }
     return y;
@@ -188,9 +227,9 @@ export function qdepthwise(r: Resident, x: QT, d: DwResident, act: number, out: 
   const y = r.alloc([N, C, OH, OW]);
   for (let n = 0; n < N; n++) {
     const t = tmp.ptr + n * plane * C * 4;
-    r.ar.pQDepthwise([C, H, W, OH, OW, d.kh, d.kw, d.sy, d.sx, d.pt, d.pl, x.ptr + n * C * H * W, x.q.ptr.zp,
+    r.ar.pQDepthwise([C, H, W, OH, OW, d.kh, d.kw, g.sy, g.sx, g.pt, g.pl, x.ptr + n * C * H * W, x.q.ptr.zp,
       d.ptr.w, d.ptr.sw, d.ptr.bias, act, t, 0, 0, 0]);
-    r.ar.k.transpose_f32(plane, C, t, y.ptr + n * C * plane * 4);
+    r.ar.pTranspose(plane, C, t, y.ptr + n * C * plane * 4);
   }
   r.ar.release(tmp.ptr);
   return y;

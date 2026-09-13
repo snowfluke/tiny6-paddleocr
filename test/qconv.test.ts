@@ -3,7 +3,7 @@ import { loadKernels } from "../src/wasm/backend.ts";
 import { Resident } from "../src/runtime/resident.ts";
 import { conv2d, type ConvAttrs } from "../src/ops/nn.ts";
 import { dequantizeLinear, qgemmReference, quantizeLinear } from "../src/ops/quant.ts";
-import { dequantizeFromQ, prepareQConv, qconv1x1, qdepthwise, quantizeToQ, uploadDepthwise, uploadQConv, uploadQParams } from "../src/ops/qconv.ts";
+import { dequantizeFromQ, prepareQConv, qconv1x1, qconvDense, qdepthwise, quantizeToQ, uploadDepthwise, uploadQConv, uploadQParams } from "../src/ops/qconv.ts";
 import type { Tensor } from "../src/runtime/tensor.ts";
 
 const wasm = new Uint8Array(await Bun.file("src/wasm/kernels.wasm").arrayBuffer());
@@ -99,12 +99,41 @@ for (const [C, H, W, k, s] of [[32, 9, 7, 3, 1], [16, 8, 10, 3, 2], [16, 7, 7, 5
     const arena = await loadKernels(wasm);
     const r = new Resident(arena);
     const xp = uploadQParams(r, xq.scale, xq.zp);
-    const d = uploadDepthwise(r, w, bias, { sy: s, sx: s, pt: pad, pl: pad }, xq.scale);
+    const d = uploadDepthwise(r, w, bias, xq.scale);
     const xr = quantizeToQ(r, r.upload(x), xp);
-    const got = r.download(qdepthwise(r, xr, d, 1, null) as never);
+    const got = r.download(qdepthwise(r, xr, d, { sy: s, sx: s, pt: pad, pl: pad, pb: pad, pr: pad }, 1, null) as never);
     const sc = { dims: [C], data: xq.scale }, zp = { dims: [C], data: Float32Array.from(xq.zp) };
     const xdq = dequantizeLinear(quantizeLinear(x, sc, zp, 1), sc, zp, 1);
     const ref = conv2d(xdq, w, { dims: [C], data: bias }, { kernel: [k, k], strides: [s, s], pads: [pad, pad, pad, pad], dilations: [1, 1], group: C });
+    expect(got.dims).toEqual(ref.dims);
+    let maxErr = 0, maxRef = 0;
+    for (let i = 0; i < ref.data.length; i++) {
+      const v = Math.max(ref.data[i], 0);
+      maxErr = Math.max(maxErr, Math.abs(got.data[i] - v));
+      maxRef = Math.max(maxRef, Math.abs(v));
+    }
+    expect(maxErr).toBeLessThan(0.02 * maxRef);
+    arena.destroy();
+  });
+}
+
+for (const [Cin, Cout, H, W, k, s, pad] of [[3, 16, 9, 11, 3, 2, 1], [32, 16, 8, 7, 3, 1, 1], [16, 8, 6, 6, 2, 1, 0]]) {
+  test(`int8 dense ${k}x${k} stride ${s} Cin ${Cin} tracks the fp32 conv`, async () => {
+    const x = tensor([1, Cin, H, W], -1, 1);
+    const w = tensor([Cout, Cin, k, k], -0.3, 0.3);
+    const bias = tensor([Cout], -0.5, 0.5).data;
+    const xq = calibrate(x);
+    const arena = await loadKernels(wasm);
+    const r = new Resident(arena);
+    const xp = uploadQParams(r, xq.scale, xq.zp);
+    const q = uploadQConv(r, prepareQConv(w, bias, xq.scale, xq.zp));
+    const cs = (Cin + 3) & ~3;
+    const xr = quantizeToQ(r, r.upload(x), xp, cs);
+    const geom = { kh: k, kw: k, sy: s, sx: s, pt: pad, pl: pad, pb: pad, pr: pad };
+    const got = r.download(qconvDense(r, xr, q, geom, 1, 0, 0, null) as never);
+    const sc = { dims: [Cin], data: xq.scale }, zp = { dims: [Cin], data: Float32Array.from(xq.zp) };
+    const xdq = dequantizeLinear(quantizeLinear(x, sc, zp, 1), sc, zp, 1);
+    const ref = conv2d(xdq, w, { dims: [Cout], data: bias }, { kernel: [k, k], strides: [s, s], pads: [pad, pad, pad, pad], dilations: [1, 1], group: 1 });
     expect(got.dims).toEqual(ref.dims);
     let maxErr = 0, maxRef = 0;
     for (let i = 0; i < ref.data.length; i++) {

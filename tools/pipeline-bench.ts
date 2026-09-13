@@ -10,7 +10,8 @@ import { defaultRecWorkers, Ocr } from "../src/ocr.ts";
 import { makeRecWorker } from "../src/node.ts";
 import { decodeImage } from "../src/image/jpeg.ts";
 
-const [imageArg, workersArg, runsArg] = process.argv.slice(2);
+const int8 = process.argv.includes("--int8");
+const [imageArg, workersArg, runsArg] = process.argv.slice(2).filter((a) => a !== "--int8");
 const image = imageArg ?? "test/images/receipt.jpg";
 const recWorkers = workersArg ? Number(workersArg) : defaultRecWorkers();
 const runs = Number(runsArg ?? 6);
@@ -24,6 +25,7 @@ const ocr = await Ocr.create({
   wasmShared: await read("src/wasm/kernels.shared.wasm"),
   recWorkers,
   makeRecWorker: recWorkers > 1 ? makeRecWorker : undefined,
+  ...(int8 ? { detCalib: await Bun.file("models/det.calib.json").text(), recCalib: await Bun.file("models/rec.calib.json").text() } : {}),
 });
 const img = await decodeImage(await read(image));
 

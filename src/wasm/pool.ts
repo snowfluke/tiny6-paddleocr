@@ -17,6 +17,15 @@ export const JOB = {
   convStrip: 10,
   qgemm: 11,
   qdepthwise: 12,
+  qconvDense: 13,
+  quantize: 14,
+  dequantize: 15,
+  qscale: 16,
+  transpose: 17,
+  qadd: 18,
+  qresize2x: 19,
+  qconcat: 20,
+  qmaxpool: 21,
 } as const;
 
 /** Int32 slots in the control block: 0 sequence, 1 completions, 2 op, 3+ args. */
@@ -67,9 +76,17 @@ function runShare(k, c, index, count) {
     : op === ${JOB.binary} ? c[a + 2]
     : op === ${JOB.convStrip} ? c[a + 13]
     : op === ${JOB.qdepthwise} ? c[a + 3]
+    : op === ${JOB.qconvDense} ? c[a + 2] * c[a + 3]
+    : op === ${JOB.quantize} ? c[a + 2]
+    : op === ${JOB.dequantize} ? c[a + 1]
+    : op === ${JOB.qscale} ? c[a + 8]
+    : op === ${JOB.qadd} ? c[a + 10]
+    : op === ${JOB.qresize2x} ? c[a + 4]
+    : op === ${JOB.qconcat} ? c[a + 9]
+    : op === ${JOB.qmaxpool} ? c[a + 1]
     : c[a];
   // Ranges the micro-kernels want in multiples of eight: GEMM columns, int8 GEMM rows.
-  const byCols = op === ${JOB.gemm} || op === ${JOB.unary} || op === ${JOB.binary} || op === ${JOB.convStrip} || op === ${JOB.qgemm};
+  const byCols = op === ${JOB.gemm} || op === ${JOB.unary} || op === ${JOB.binary} || op === ${JOB.convStrip} || op === ${JOB.qgemm} || op === ${JOB.qconvDense};
   const blocks = count === 1 ? 1 : Math.max(1, Math.min(${BLOCKS_PER_THREAD} * count, byCols ? Math.floor(total / 8) : total));
   for (;;) {
     const i = count === 1 ? 0 : Atomics.add(c, ${CLAIM}, 1);
@@ -118,6 +135,49 @@ function runBlock(k, c, op, a, index, count) {
     // Rows of the int8 product. Args: m k n a b c sw bias comp act res rs rzp oinv ozp out_i8, then p0 p1 as floats.
     const [lo, hi] = shareBy8(c[a], index, count);
     if (lo < hi) k.qgemm(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], c[a+14], c[a+15], f[a+16], f[a+17], lo, hi);
+  } else if (op === ${JOB.qconvDense}) {
+    // Output pixels [lo, hi): each share builds its own rows of the column
+    // matrix and multiplies them, so no share waits on another's im2col.
+    // Args: ih iw oh ow kh kw sy sx pt pl cs x zp col n b c sw bias comp act oinv ozp out_i8, then p0 p1 as floats.
+    const m = c[a + 2] * c[a + 3];
+    const [lo, hi] = shareBy8(m, index, count);
+    if (lo < hi) {
+      const k_ = c[a + 4] * c[a + 5] * c[a + 10];
+      k.qim2col(c[a], c[a+1], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], c[a+10], c[a+11], c[a+12], c[a+13], lo, hi);
+      k.qgemm(m, k_, c[a+14], c[a+13], c[a+15], c[a+16], c[a+17], c[a+18], c[a+19], c[a+20], 0, 0, 0, c[a+21], c[a+22], c[a+23], f[a+24], f[a+25], lo, hi);
+    }
+  } else if (op === ${JOB.quantize}) {
+    // Pixels. Args: channels cs pixels x out inv zp.
+    const [lo, hi] = share(c[a + 2], index, count);
+    if (lo < hi) k.quantize_nhwc(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], lo, hi);
+  } else if (op === ${JOB.dequantize}) {
+    // Pixels. Args: channels pixels q out scale zp.
+    const [lo, hi] = share(c[a + 1], index, count);
+    if (lo < hi) k.dequantize_nchw(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], lo, hi);
+  } else if (op === ${JOB.qscale}) {
+    // Pixels. Args: c x zp scale factor out oinv ozp pixels.
+    const [lo, hi] = share(c[a + 8], index, count);
+    if (lo < hi) k.qscale_channels(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], lo, hi);
+  } else if (op === ${JOB.transpose}) {
+    // Rows. Args: rows cols a out.
+    const [lo, hi] = share(c[a], index, count);
+    if (lo < hi) k.transpose_f32(c[a], c[a+1], c[a+2], c[a+3], lo, hi);
+  } else if (op === ${JOB.qadd}) {
+    // Pixels. Args: c a azp ascale b bzp bscale out oinv ozp pixels.
+    const [lo, hi] = share(c[a + 10], index, count);
+    if (lo < hi) k.qadd(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], c[a+9], lo, hi);
+  } else if (op === ${JOB.qresize2x}) {
+    // Output rows. Args: c iw x out oh.
+    const [lo, hi] = share(c[a + 4], index, count);
+    if (lo < hi) k.qresize2x(c[a], c[a+1], c[a+2], c[a+3], lo, hi);
+  } else if (op === ${JOB.qconcat}) {
+    // Pixels. Args: cin cout off x zx sx out oinv ozp pixels.
+    const [lo, hi] = share(c[a + 9], index, count);
+    if (lo < hi) k.qconcat_in(c[a], c[a+1], c[a+2], c[a+3], c[a+4], c[a+5], c[a+6], c[a+7], c[a+8], lo, hi);
+  } else if (op === ${JOB.qmaxpool}) {
+    // Rows. Args: c h w x out.
+    const [lo, hi] = share(c[a + 1], index, count);
+    if (lo < hi) k.qmaxpool2x2same(c[a], c[a+1], c[a+2], c[a+3], c[a+4], lo, hi);
   } else if (op === ${JOB.qdepthwise}) {
     // Output rows. Args: c ih iw oh ow kh kw sy sx pt pl x xzp w sw bias act out oinv ozp out_i8.
     const [lo, hi] = share(c[a + 3], index, count);

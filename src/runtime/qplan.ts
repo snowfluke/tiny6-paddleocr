@@ -13,6 +13,7 @@
 // that follows a planned convolution, which folds into its epilogue.
 
 import type { OnnxGraph, OnnxNode } from "../onnx/parse.ts";
+import { convAttrs } from "./graph.ts";
 import type { Resident, RT } from "./resident.ts";
 import type { Tensor } from "./tensor.ts";
 import { ACT_RELU } from "./fuse.ts";
@@ -22,6 +23,7 @@ import {
   dequantizeFromQ,
   prepareQConv,
   qconv1x1,
+  qconvDense,
   qdepthwise,
   type QParams,
   type QT,
@@ -58,6 +60,8 @@ const MIN_PLANE = 16;
 export class QPlan {
   readonly handlers = new Map<OnnxNode, Handler>();
   private readonly params = new Map<string, QParams>();
+  /** fp32 tensors quantized this run, so a tensor read by several planned nodes converts once. */
+  private readonly quantized = new Map<number, QT>();
 
   constructor(
     private readonly r: Resident,
@@ -77,9 +81,23 @@ export class QPlan {
     return p;
   }
 
+  /** Forget the run's boundary conversions; the arena recycles their memory. */
+  beginRun() {
+    this.quantized.clear();
+  }
+
   /** An input as int8, quantizing an fp32 tensor with the name's parameters. */
-  asQ(name: string, v: QVal): QT {
-    return isQ(v) ? v : quantizeToQ(this.r, v, this.paramsOf(name));
+  asQ(name: string, v: QVal, cs?: number): QT {
+    if (isQ(v)) {
+      if (cs !== undefined && v.cs !== cs) throw new Error(`${name}: channel stride ${v.cs}, wanted ${cs}`);
+      return v;
+    }
+    const want = cs ?? v.dims[1];
+    const hit = this.quantized.get(v.ptr);
+    if (hit && hit.cs === want) return hit;
+    const q = quantizeToQ(this.r, v, this.paramsOf(name), cs);
+    this.quantized.set(v.ptr, q);
+    return q;
   }
 
   asRT(v: QVal): RT {
@@ -115,7 +133,7 @@ export function buildPlan(
   // Pass one: which nodes can run on int8 at all.
   const planned = new Set<OnnxNode>();
   const absorbed = new Map<OnnxNode, OnnxNode>(); // gelu -> conv
-  const convKind = (n: OnnxNode): "1x1" | "dw" | null => {
+  const convKind = (n: OnnxNode): "1x1" | "dense" | "dw" | null => {
     const w = consts.get(n.input[1]);
     if (!w || w.dims.length !== 4) return null;
     const [cout, cinPer, kh, kw] = w.dims;
@@ -128,6 +146,12 @@ export function buildPlan(
     if (group === 1 && kh === 1 && kw === 1 && strides[0] === 1 && strides[1] === 1 && pads.every((p) => !p)) {
       return cinPer % 4 === 0 && cout % 8 === 0 ? "1x1" : null;
     }
+    if (group === 1 && kh <= 5 && kw <= 5 && cout % 8 === 0) {
+      // A channel count that is not a multiple of four is padded on the way
+      // in, which only a boundary tensor (fp32 producer) can do.
+      const src = producer.get(n.input[0]);
+      return cinPer % 4 === 0 || !src || !planned.has(src) ? "dense" : null;
+    }
     if (group === cout && cinPer === 1 && kh === kw && (kh === 3 || kh === 5) && strides[0] <= 2 && strides[1] <= 2) {
       return cout % 16 === 0 ? "dw" : null;
     }
@@ -136,13 +160,31 @@ export function buildPlan(
   for (const n of g.nodes) {
     if (n.opType === "Conv" && convKind(n)) planned.add(n);
   }
-  // Consumers of int8 tensors that can stay on int8.
+  // Consumers of int8 tensors that can stay on int8. In graph order, so a
+  // chain of them (Add -> Resize -> Add) plans through.
+  const dims = (name: string) => calib[name]?.dims;
+  const c16 = (name: string) => { const d = dims(name); return !!d && d.length === 4 && d[1] % 16 === 0; };
   for (const n of g.nodes) {
     const p0 = producer.get(n.input[0]);
     if (!p0 || !planned.has(p0)) continue;
     if (n.opType === "ReduceMean") {
       const axes = ints(n, "axes", []);
       if (axes.length === 2 && axes[0] === 2 && axes[1] === 3) planned.add(n);
+    } else if (n.opType === "GlobalAveragePool") {
+      planned.add(n);
+    } else if (n.opType === "Add" && n.input.length === 2 && calib[n.output[0]] && c16(n.output[0])) {
+      const p1 = producer.get(n.input[1]);
+      const same = JSON.stringify(dims(n.input[0])) === JSON.stringify(dims(n.input[1]));
+      if (p1 && planned.has(p1) && same) planned.add(n);
+    } else if (n.opType === "Resize" && calib[n.output[0]]) {
+      const sc = consts.get(n.input[2])?.data;
+      const mode = attr(n, "mode")?.s ?? "nearest";
+      if (sc && sc.length === 4 && sc[0] === 1 && sc[1] === 1 && sc[2] === 2 && sc[3] === 2 && mode === "nearest") planned.add(n);
+    } else if (n.opType === "Concat" && (attr(n, "axis")?.i ?? 0) === 1 && calib[n.output[0]]) {
+      if (n.input.every((i) => { const p = producer.get(i); return p && planned.has(p) && c16(i); })) planned.add(n);
+    } else if (n.opType === "MaxPool" && calib[n.output[0]]) {
+      const k = ints(n, "kernel_shape", []), st = ints(n, "strides", [1, 1]);
+      if (k[0] === 2 && k[1] === 2 && st[0] === 1 && st[1] === 1 && attr(n, "auto_pad")?.s === "SAME_UPPER") planned.add(n);
     } else if (n.opType === "Mul" && n.input.length === 2 && calib[n.output[0]]) {
       const f = calib[n.input[1]]?.dims;
       if (f && f.length === 4 && f[2] === 1 && f[3] === 1) planned.add(n);
@@ -190,15 +232,41 @@ export function buildPlan(
           const res = resName ? plan.asQ(resName, x[3]!) : null;
           return [qconv1x1(r, xq, q, act, p0, p1, res, out)];
         });
+      } else if (kind === "dense") {
+        const q = uploadQConv(r, prepareQConv(w, bias, pin.scale, pin.zp));
+        const cs = (w.dims[1] + 3) & ~3;
+        plan.handlers.set(n, (x) => {
+          // Pads may depend on the input size (auto_pad), so resolve per run.
+          const at = convAttrs(n, x[0]!, w.dims.slice(2));
+          const geom = { kh: w.dims[2], kw: w.dims[3], sy: at.strides[0], sx: at.strides[1], pt: at.pads[0], pl: at.pads[1], pb: at.pads[2], pr: at.pads[3] };
+          return [qconvDense(r, plan.asQ(n.input[0], x[0]!, cs), q, geom, act, p0, p1, out)];
+        });
       } else {
         if (act === ACT_GELU) throw new Error("depthwise gelu epilogue is not implemented");
-        const strides = ints(n, "strides", [1, 1]), pads = ints(n, "pads", [0, 0, 0, 0]);
-        const dw = uploadDepthwise(r, w, bias, { sy: strides[0], sx: strides[1], pt: pads[0], pl: pads[1] }, pin.scale);
-        plan.handlers.set(n, (x) => [qdepthwise(r, plan.asQ(n.input[0], x[0]!), dw, act, out)]);
+        const dw = uploadDepthwise(r, w, bias, pin.scale);
+        plan.handlers.set(n, (x) => {
+          const at = convAttrs(n, x[0]!, w.dims.slice(2));
+          const geom = { sy: at.strides[0], sx: at.strides[1], pt: at.pads[0], pl: at.pads[1], pb: at.pads[2], pr: at.pads[3] };
+          return [qdepthwise(r, plan.asQ(n.input[0], x[0]!), dw, geom, act, out)];
+        });
       }
-    } else if (n.opType === "ReduceMean") {
+    } else if (n.opType === "ReduceMean" || n.opType === "GlobalAveragePool") {
       plan.paramsOf(n.input[0]);
       plan.handlers.set(n, (x) => [qmean(r, plan.asQ(n.input[0], x[0]!))]);
+    } else if (n.opType === "Add") {
+      const pout = out ?? plan.paramsOf(n.output[0]);
+      for (const i of n.input) plan.paramsOf(i);
+      plan.handlers.set(n, (x) => [qadd(r, plan.asQ(n.input[0], x[0]!), plan.asQ(n.input[1], x[1]!), pout)]);
+    } else if (n.opType === "Resize") {
+      plan.paramsOf(n.input[0]);
+      plan.handlers.set(n, (x) => [qresize2x(r, plan.asQ(n.input[0], x[0]!))]);
+    } else if (n.opType === "Concat") {
+      const pout = out ?? plan.paramsOf(n.output[0]);
+      for (const i of n.input) plan.paramsOf(i);
+      plan.handlers.set(n, (x) => [qconcat(r, n.input.map((i, k) => plan.asQ(i, x[k]!)), pout)]);
+    } else if (n.opType === "MaxPool") {
+      plan.paramsOf(n.input[0]);
+      plan.handlers.set(n, (x) => [qmaxpool2x2same(r, plan.asQ(n.input[0], x[0]!))]);
     } else if (n.opType === "Mul") {
       plan.paramsOf(n.input[0]);
       const pout = out ?? plan.paramsOf(n.output[0]);
@@ -239,7 +307,49 @@ function qscale(r: Resident, x: QT, factor: RT, out: QParams): QT {
   const y = allocQ(r, x.dims, out);
   for (let n = 0; n < N; n++) {
     const off = n * C * H * W;
-    r.ar.k.qscale_channels(C, x.ptr + off, x.q.ptr.zp, x.q.ptr.scale, factor.ptr + n * C * 4, y.ptr + off, out.ptr.inv, out.ptr.zp, 0, H * W);
+    r.ar.pQScale(C, x.ptr + off, x.q.ptr.zp, x.q.ptr.scale, factor.ptr + n * C * 4, y.ptr + off, out.ptr.inv, out.ptr.zp, H * W);
   }
+  return y;
+}
+
+// ---- glue between convolutions ------------------------------------------------
+
+function qadd(r: Resident, a: QT, b: QT, out: QParams): QT {
+  const [N, C, H, W] = a.dims;
+  const y = allocQ(r, a.dims, out);
+  for (let n = 0; n < N; n++) {
+    const off = n * C * H * W;
+    r.ar.pQAdd([C, a.ptr + off, a.q.ptr.zp, a.q.ptr.scale, b.ptr + off, b.q.ptr.zp, b.q.ptr.scale, y.ptr + off, out.ptr.inv, out.ptr.zp, H * W]);
+  }
+  return y;
+}
+
+/** Nearest 2x keeps the input's scale: every output byte is an input byte. */
+function qresize2x(r: Resident, x: QT): QT {
+  const [N, C, H, W] = x.dims;
+  const y = allocQ(r, [N, C, 2 * H, 2 * W], x.q);
+  for (let n = 0; n < N; n++) r.ar.pQResize2x(C, W, x.ptr + n * C * H * W, y.ptr + n * C * 4 * H * W, 2 * H);
+  return y;
+}
+
+function qconcat(r: Resident, xs: QT[], out: QParams): QT {
+  const [N, , H, W] = xs[0].dims;
+  const C = xs.reduce((s, x) => s + x.dims[1], 0);
+  const y = allocQ(r, [N, C, H, W], out);
+  let off = 0;
+  for (const x of xs) {
+    for (let n = 0; n < N; n++) {
+      r.ar.pQConcat([x.dims[1], C, off, x.ptr + n * x.dims[1] * H * W, x.q.ptr.zp, x.q.ptr.scale, y.ptr + n * C * H * W, out.ptr.inv, out.ptr.zp, H * W]);
+    }
+    off += x.dims[1];
+  }
+  return y;
+}
+
+/** Max commutes with dequantization, so the output keeps the input's parameters. */
+function qmaxpool2x2same(r: Resident, x: QT): QT {
+  const [N, C, H, W] = x.dims;
+  const y = allocQ(r, x.dims, x.q);
+  for (let n = 0; n < N; n++) r.ar.pQMaxPool(C, H, W, x.ptr + n * C * H * W, y.ptr + n * C * H * W);
   return y;
 }

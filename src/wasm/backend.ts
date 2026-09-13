@@ -44,9 +44,17 @@ export type Kernels = {
   ): void;
   qmean_channels(c: number, pixels: number, x: number, zp: number, scale: number, out: number): void;
   qscale_channels(c: number, x: number, zp: number, scale: number, factor: number, out: number, oinv: number, ozp: number, lo: number, hi: number): void;
-  quantize_nhwc(channels: number, pixels: number, x: number, out: number, inv: number, zp: number, lo: number, hi: number): void;
+  quantize_nhwc(channels: number, cs: number, pixels: number, x: number, out: number, inv: number, zp: number, lo: number, hi: number): void;
+  qim2col(
+    ih: number, iw: number, ow: number, kh: number, kw: number, sy: number, sx: number, pt: number, pl: number,
+    cs: number, x: number, zp: number, col: number, lo: number, hi: number,
+  ): void;
   dequantize_nchw(channels: number, pixels: number, q: number, out: number, scale: number, zp: number, lo: number, hi: number): void;
-  transpose_f32(rows: number, cols: number, a: number, out: number): void;
+  transpose_f32(rows: number, cols: number, a: number, out: number, lo: number, hi: number): void;
+  qadd(c: number, a: number, azp: number, ascale: number, b: number, bzp: number, bscale: number, out: number, oinv: number, ozp: number, lo: number, hi: number): void;
+  qresize2x(c: number, iw: number, x: number, out: number, lo: number, hi: number): void;
+  qconcat_in(cin: number, cout: number, off: number, x: number, zx: number, sx: number, out: number, oinv: number, ozp: number, lo: number, hi: number): void;
+  qmaxpool2x2same(c: number, h: number, w: number, x: number, out: number, lo: number, hi: number): void;
   reduce_mean(outer: number, inner: number, a: number, out: number): void;
   maxpool2x2(planes: number, h: number, w: number, a: number, out: number, lo: number, hi: number): void;
   affine_channels(
@@ -225,6 +233,61 @@ export class Arena {
       this.pool.dispatch(JOB.qgemm, args, { 16: p0, 17: p1 });
     } else {
       (this.k.qgemm as (...a: number[]) => void)(...args, p0, p1, 0, m);
+    }
+  }
+
+  // The int8 region's edges and its byte-wide passes, split by pixel.
+  pQuantize(channels: number, cs: number, pixels: number, x: number, out: number, inv: number, zp: number) {
+    if (this.pool && channels * pixels >= PARALLEL_MIN) this.pool.dispatch(JOB.quantize, [channels, cs, pixels, x, out, inv, zp]);
+    else this.k.quantize_nhwc(channels, cs, pixels, x, out, inv, zp, 0, pixels);
+  }
+
+  pDequantize(channels: number, pixels: number, q: number, out: number, scale: number, zp: number) {
+    if (this.pool && channels * pixels >= PARALLEL_MIN) this.pool.dispatch(JOB.dequantize, [channels, pixels, q, out, scale, zp]);
+    else this.k.dequantize_nchw(channels, pixels, q, out, scale, zp, 0, pixels);
+  }
+
+  pQScale(c: number, x: number, zp: number, scale: number, factor: number, out: number, oinv: number, ozp: number, pixels: number) {
+    if (this.pool && c * pixels >= PARALLEL_MIN) this.pool.dispatch(JOB.qscale, [c, x, zp, scale, factor, out, oinv, ozp, pixels]);
+    else this.k.qscale_channels(c, x, zp, scale, factor, out, oinv, ozp, 0, pixels);
+  }
+
+  pQAdd(args: number[]) {
+    const [c, , , , , , , , , , pixels] = args;
+    if (this.pool && c * pixels >= PARALLEL_MIN) this.pool.dispatch(JOB.qadd, args);
+    else (this.k.qadd as (...a: number[]) => void)(...args.slice(0, 10), 0, pixels);
+  }
+
+  pQResize2x(c: number, iw: number, x: number, out: number, oh: number) {
+    if (this.pool && c * iw * oh >= PARALLEL_MIN) this.pool.dispatch(JOB.qresize2x, [c, iw, x, out, oh]);
+    else this.k.qresize2x(c, iw, x, out, 0, oh);
+  }
+
+  pQConcat(args: number[]) {
+    const [cin, , , , , , , , , pixels] = args;
+    if (this.pool && cin * pixels >= PARALLEL_MIN) this.pool.dispatch(JOB.qconcat, args);
+    else (this.k.qconcat_in as (...a: number[]) => void)(...args.slice(0, 9), 0, pixels);
+  }
+
+  pQMaxPool(c: number, h: number, w: number, x: number, out: number) {
+    if (this.pool && c * h * w >= PARALLEL_MIN) this.pool.dispatch(JOB.qmaxpool, [c, h, w, x, out]);
+    else this.k.qmaxpool2x2same(c, h, w, x, out, 0, h);
+  }
+
+  pTranspose(rows: number, cols: number, a: number, out: number) {
+    if (this.pool && rows * cols >= PARALLEL_MIN) this.pool.dispatch(JOB.transpose, [rows, cols, a, out]);
+    else this.k.transpose_f32(rows, cols, a, out, 0, rows);
+  }
+
+  /** im2col and int8 GEMM for a dense convolution, split by output pixel; args as in JOB.qconvDense. */
+  pQConvDense(args: number[], p0: number, p1: number) {
+    const [, , oh, ow, kh, kw, , , , , cs, x, zp, col, n, b, c, sw, bias, comp, act, oinv, ozp, outI8] = args;
+    const m = oh * ow, k = kh * kw * cs;
+    if (this.pool && m * n >= PARALLEL_MIN) {
+      this.pool.dispatch(JOB.qconvDense, args, { 24: p0, 25: p1 });
+    } else {
+      this.k.qim2col(args[0], args[1], ow, kh, kw, args[6], args[7], args[8], args[9], cs, x, zp, col, 0, m);
+      this.k.qgemm(m, k, n, col, b, c, sw, bias, comp, act, 0, 0, 0, oinv, ozp, outI8, p0, p1, 0, m);
     }
   }
 
