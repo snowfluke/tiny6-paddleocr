@@ -535,6 +535,46 @@ function renderComponent(c: Component, q: Int32Array, outSize: number) {
   for (let by = 0; by < c.blocksPerColumn; by++) {
     for (let bx = 0; bx < c.blocksPerLine; bx++) {
       const off = (by * c.blocksPerLine + bx) * 64;
+      // A block whose only non-zero coefficient is DC reconstructs to a flat
+      // patch, and flat regions are common in a photographed receipt - the
+      // background between glyphs, specular highlights, the white margin all
+      // have no AC energy. EOB coding leaves the rest of the block at zero, so
+      // proving it is a scan over just the coefficients this scale reads: at
+      // 1/2 and 1/4 the higher frequencies are dropped anyway, and a block that
+      // is flat at 1/2 need not be flat at 1/1.
+      let flat = true;
+      for (let y = 0; y < n && flat; y++) {
+        for (let u = 0; u < n; u++) {
+          if (y === 0 && u === 0) continue;
+          if (c.coeffs[off + y * 8 + u]) {
+            flat = false;
+            break;
+          }
+        }
+      }
+      if (flat) {
+        // Same arithmetic as the general path would do, not an algebraically
+        // equivalent shortcut: the two passes each contribute C(0) = sqrt(1/2)
+        // as a float32, so the sum is a float32-rounded product and the value
+        // is not exactly block*q[0]/8. Rounding the shortcut instead would move
+        // Math.round across its .5 boundary for a small share of blocks and
+        // silently change bytes.
+        const t = T[0];
+        // bb is what the general path stores in block[0][0] (a Float32Array),
+        // and its first pass writes fround(t * bb) into tmp. Both passes carry
+        // the same factor, so the accumulator is t * fround(t * bb).
+        const bb = Math.fround(c.coeffs[off] * q[0]);
+        const s = t * Math.fround(t * bb);
+        const v = Math.round(s / div + 128);
+        const p = v < 0 ? 0 : v > 255 ? 255 : v;
+        const ox = bx * n;
+        const oy = by * n;
+        for (let y = 0; y < n; y++) {
+          const row = (oy + y) * c.lineWidth + ox;
+          for (let x = 0; x < n; x++) c.pixels[row + x] = p;
+        }
+        continue;
+      }
       if (n === 8) {
         for (let i = 0; i < 64; i++) block[i] = c.coeffs[off + i] * q[i];
       } else {

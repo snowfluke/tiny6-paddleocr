@@ -409,6 +409,35 @@ test("a scaled decode halves the raster and preserves its levels", async () => {
   expect(sum / (w * h * 3)).toBeLessThan(5);
 });
 
+test("the decode raster is bit-identical to what it has always been", async () => {
+  // The inverse transform is the hot loop of the decoder and it is written for
+  // speed, with a shortcut for blocks whose only non-zero coefficient is DC
+  // (they reconstruct to a flat patch, and 91% of the blocks in these receipts
+  // are flat). Nothing about that is allowed to move a pixel: the shortcut
+  // reproduces the general path's float ops exactly, because rounding an
+  // algebraically equal but differently-ordered expression moves Math.round
+  // across its .5 boundary for a small share of blocks.
+  //
+  // These hashes were taken before the shortcut existed and must not change.
+  // A failure here means decoded pixels moved, which the OCR score would only
+  // report as a fraction of a percentage point much later.
+  const fnv = (d: Uint8Array) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < d.length; i++) {
+      h ^= d[i];
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  };
+  const buf = await read("test/images/receipt.jpg");
+  const full = decodeJpeg(buf);
+  const half = decodeJpeg(buf, 2);
+  expect([full.width, full.height, full.data.length]).toEqual([720, 1280, 3686400]);
+  expect([half.width, half.height, half.data.length]).toEqual([360, 640, 921600]);
+  expect(fnv(full.data)).toBe("92f8be10");
+  expect(fnv(half.data)).toBe("bfa9ed72");
+});
+
 test("an unsupported downscale is rejected rather than silently ignored", async () => {
   const buf = await read("test/images/receipt.jpg");
   expect(() => decodeJpeg(buf, 3 as 1)).toThrow(/downscale/);
