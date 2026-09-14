@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
 import { defaultRecWorkers, isSeparator, Ocr } from "../src/ocr.ts";
-import { DEFAULT_DETECT } from "../src/pipeline/detect.ts";
+import { DEFAULT_DETECT, REFERENCE_BINARIZE } from "../src/pipeline/detect.ts";
 import { convexHull, mergeOverlapping, minAreaRect } from "../src/pipeline/boxes.ts";
 import { makeRecWorker } from "../src/node.ts";
-import { decodeJpeg } from "../src/image/jpeg.ts";
+import { decodeImage, decodeJpeg } from "../src/image/jpeg.ts";
 import { cropForBox, recognizeBatch } from "../src/pipeline/recognize.ts";
 import { decodePng } from "../src/image/png.ts";
 import { parseOnnx } from "../src/onnx/parse.ts";
@@ -217,6 +217,27 @@ test("receipt matches the ORT reference on most lines", async () => {
   ocr.destroy();
 }, 180_000);
 
+/**
+ * The reference transcript above is what pins the default: the reference path
+ * rounds the probability to a byte, so its effective cut is one 8-bit step.
+ * Raising the cut drops the low-probability regions that step lets through -
+ * on SROIE that is +1.7 points of character similarity for 5% more time, with
+ * the median box count unchanged. It must never invent regions, and the
+ * default must stay the reference or every compared transcript shifts.
+ */
+test("raising binarizeThreshold drops regions and never adds them", async () => {
+  const ocr = await makeOcr(4);
+  const img = await decodePng(await read("test/images/receipt.png"));
+  const at960 = { ...DEFAULT_DETECT, maxSideLength: 960 };
+
+  const reference = ocr.detect(img, at960).boxes.length;
+  const raised = ocr.detect(img, { ...at960, binarizeThreshold: 0.5 }).boxes.length;
+
+  expect(raised).toBeLessThanOrEqual(reference);
+  expect(DEFAULT_DETECT.binarizeThreshold).toBe(REFERENCE_BINARIZE);
+  ocr.destroy();
+}, 180_000);
+
 test("the confidence filter drops barcode noise and keeps the text", async () => {
   const ocr = await makeOcr();
   const img = await decodePng(await read("test/images/receipt.png"));
@@ -340,6 +361,88 @@ test("the JPEG decoder lands close to the lossless original", async () => {
 test("the recognition pool is not started where it would lose", () => {
   // Two workers measured slower than inline; six is the ceiling that pays.
   expect([1, 2, 3, 4, 8, 16].map((cores) => defaultRecWorkers(cores))).toEqual([0, 0, 3, 4, 6, 6]);
+});
+
+test("a scaled decode halves the raster and preserves its levels", async () => {
+  const buf = await read("test/images/receipt.jpg");
+  const full = decodeJpeg(buf);
+  const half = decodeJpeg(buf, 2);
+
+  expect([half.width, half.height]).toEqual([full.width / 2, full.height / 2]);
+
+  // The low-frequency corner must reconstruct the same block means. A wrong
+  // IDCT prefactor scales every sample instead (measured as -15.8pp of OCR
+  // similarity when the divisor was taken as n/2 rather than 4), and reading
+  // the flat first n*n coefficients instead of the 2D corner loses the
+  // vertical frequencies (-23.3pp). Both show up here as a channel mean that
+  // has drifted, which the OCR score would only reveal much later.
+  const channelMean = (img: { data: Uint8Array }, c: number) => {
+    let s = 0;
+    for (let p = c; p < img.data.length; p += 4) s += img.data[p];
+    return s / (img.data.length / 4);
+  };
+  for (let c = 0; c < 3; c++) {
+    expect(channelMean(half, c)).toBeCloseTo(channelMean(full, c), 0);
+    expect(Math.abs(channelMean(half, c) - channelMean(full, c))).toBeLessThan(2);
+  }
+
+  // And it has to agree with a plain box downsample of the full-resolution
+  // decode, which is the resample it replaces.
+  let sum = 0;
+  const w = half.width;
+  const h = half.height;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      for (let c = 0; c < 3; c++) {
+        let s = 0;
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) {
+            const sx = Math.min(full.width - 1, x * 2 + dx);
+            const sy = Math.min(full.height - 1, y * 2 + dy);
+            s += full.data[(sy * full.width + sx) * 4 + c];
+          }
+        }
+        sum += Math.abs(s / 4 - half.data[(y * w + x) * 4 + c]);
+      }
+    }
+  }
+  expect(sum / (w * h * 3)).toBeLessThan(5);
+});
+
+test("the decode raster is bit-identical to what it has always been", async () => {
+  // The inverse transform is the hot loop of the decoder and it is written for
+  // speed, with a shortcut for blocks whose only non-zero coefficient is DC
+  // (they reconstruct to a flat patch, and 91% of the blocks in these receipts
+  // are flat). Nothing about that is allowed to move a pixel: the shortcut
+  // reproduces the general path's float ops exactly, because rounding an
+  // algebraically equal but differently-ordered expression moves Math.round
+  // across its .5 boundary for a small share of blocks.
+  //
+  // These hashes were taken before the shortcut existed and must not change.
+  // A failure here means decoded pixels moved, which the OCR score would only
+  // report as a fraction of a percentage point much later.
+  const fnv = (d: Uint8Array) => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < d.length; i++) {
+      h ^= d[i];
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return h.toString(16).padStart(8, "0");
+  };
+  const buf = await read("test/images/receipt.jpg");
+  const full = decodeJpeg(buf);
+  const half = decodeJpeg(buf, 2);
+  expect([full.width, full.height, full.data.length]).toEqual([720, 1280, 3686400]);
+  expect([half.width, half.height, half.data.length]).toEqual([360, 640, 921600]);
+  expect(fnv(full.data)).toBe("92f8be10");
+  expect(fnv(half.data)).toBe("bfa9ed72");
+});
+
+test("an unsupported downscale is rejected rather than silently ignored", async () => {
+  const buf = await read("test/images/receipt.jpg");
+  expect(() => decodeJpeg(buf, 3 as 1)).toThrow(/downscale/);
+  const png = await read("test/images/receipt.png");
+  await expect(decodeImage(png, 2)).rejects.toThrow(/JPEG/);
 });
 
 test("rule characters are dropped, text with letters or digits is not", () => {

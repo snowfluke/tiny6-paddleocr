@@ -24,7 +24,18 @@ self.onmessage = async (e: MessageEvent<RecInit | RecTask>) => {
   const msg = e.data;
   if (msg.kind === "init") {
     const arena = await loadKernels(msg.wasm);
-    session = new Session(parseOnnx(msg.rec), arena, msg.calib ? { int8: JSON.parse(msg.calib) } : {});
+    // The pool hands these bytes over a SharedArrayBuffer, which is what keeps
+    // the main thread from cloning 4.46 MB once per worker. Anything that wants
+    // a private copy has to make it here instead: the ONNX reader runs a
+    // TextDecoder over the buffer and one rejects a shared view outright
+    // ("The provided ArrayBufferView value must not be shared"), which threw
+    // inside this async handler where nothing could see it. The copy is a few
+    // milliseconds, and it happens in parallel across the workers rather than
+    // in series on the thread that is trying to paint.
+    const rec = typeof SharedArrayBuffer !== "undefined" && msg.rec.buffer instanceof SharedArrayBuffer
+      ? msg.rec.slice()
+      : msg.rec;
+    session = new Session(parseOnnx(rec), arena, msg.calib ? { int8: JSON.parse(msg.calib) } : {});
     dict = parseDictionary(msg.dict);
     postMessage("ready");
     return;

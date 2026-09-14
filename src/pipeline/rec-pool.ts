@@ -20,6 +20,19 @@ export type WorkerFactory = () => Worker;
 
 type Pending = { resolve: (d: Decoded) => void; reject: (e: Error) => void };
 
+/**
+ * Backs the bytes with a SharedArrayBuffer so a postMessage transfers a view
+ * instead of a copy. Returns them unchanged where SharedArrayBuffer is absent
+ * - a page without cross-origin isolation - or for a buffer that already is
+ * one, which is what a second pool on the same weights would hand it.
+ */
+function shareable(bytes: Uint8Array): Uint8Array {
+  if (typeof SharedArrayBuffer === "undefined" || bytes.buffer instanceof SharedArrayBuffer) return bytes;
+  const sab = new SharedArrayBuffer(bytes.length);
+  new Uint8Array(sab).set(bytes);
+  return new Uint8Array(sab);
+}
+
 export class RecPool {
   private readonly idle: Worker[] = [];
   private readonly queue: { crop: RGBA; pending: Pending }[] = [];
@@ -39,14 +52,19 @@ export class RecPool {
     assets: RecPoolAssets,
     count: number,
   ): Promise<RecPool> {
+    // One shared copy rather than one clone per worker. A plain Uint8Array in
+    // a postMessage is structurally cloned into every worker: the 4.46 MB of
+    // rec weights cost 20.7-21.8 ms of main-thread time to hand to six of them,
+    // and a view onto a SharedArrayBuffer costs 0, because the bytes are never
+    // copied at all. The workers only read them.
+    const rec = shareable(assets.rec);
     const workers = await Promise.all(
       Array.from({ length: count }, () =>
         new Promise<Worker>((resolve, reject) => {
           const w = make();
           w.onmessage = () => resolve(w);
           w.onerror = (e) => reject(new Error(`rec worker failed: ${(e as ErrorEvent).message ?? e}`));
-          // Structured clone copies the model bytes into each worker, once.
-          w.postMessage({ kind: "init", rec: assets.rec, wasm: assets.wasm, dict: assets.dict, calib: assets.calib });
+          w.postMessage({ kind: "init", rec, wasm: assets.wasm, dict: assets.dict, calib: assets.calib });
         })),
     );
     const pool = new RecPool(workers);

@@ -33,12 +33,25 @@ export type DetectOptions = {
    */
   mergeOverlap: number;
   /**
+   * Probability a pixel must reach to count as text. The default reproduces
+   * the reference path exactly: cv.findContours counts any nonzero pixel and
+   * the reference rounds the probability to a byte first, so its effective
+   * cut is one 8-bit step, 0.5/255. That is orders below the 0.3 a DB
+   * post-process is usually thresholded at, which is why the detector also
+   * fires on logos, rules and barcodes and the recogniser has to filter them
+   * out. Raising it drops those regions before recognition instead.
+   */
+  binarizeThreshold: number;
+  /**
    * Fit each region with a minimum-area rectangle instead of an upright box,
    * and straighten the crop before recognition. Off by default: it changes
    * every crop slightly, and upright pages do not need it.
    */
   rotated: boolean;
 };
+
+/** One 8-bit step: the cut the reference path's byte round-trip produces. */
+export const REFERENCE_BINARIZE = 0.5 / 255;
 
 export const DEFAULT_DETECT: DetectOptions = {
   mean: [0.485, 0.456, 0.406],
@@ -48,6 +61,7 @@ export const DEFAULT_DETECT: DetectOptions = {
   paddingVertical: 0.4,
   paddingHorizontal: 0.6,
   mergeOverlap: 0.5,
+  binarizeThreshold: REFERENCE_BINARIZE,
   rotated: false,
 };
 
@@ -91,8 +105,10 @@ export function detect(session: Session, img: RGBA, opts: DetectOptions = DEFAUL
 
   // cv.findContours counts any nonzero pixel, and the reference path rounds
   // the probability to a byte first, so the effective cut is p >= 0.5/255.
+  // Raise binarizeThreshold to drop the low-probability regions that cut lets
+  // through; DEFAULT_DETECT keeps the reference's value.
   const mask = new Uint8Array(width * height);
-  for (let i = 0; i < mask.length; i++) mask[i] = prob[i] >= 0.5 / 255 ? 1 : 0;
+  for (let i = 0; i < mask.length; i++) mask[i] = prob[i] >= opts.binarizeThreshold ? 1 : 0;
 
   const boxes: Box[] = [];
   for (const r of connectedRegions(mask, width, height, opts.rotated)) {

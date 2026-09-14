@@ -109,8 +109,10 @@ onnxruntime's answer is 7-bit weights (`reduce_range`); measured on SROIE
 that costs this model 5.7 points of token F1. 7-bit activations with 8-bit
 weights cost nothing (80.30% against fp32's 79.13%), so that is the x86
 mode. Its kernels match the same integer reference as ARM's, bit for bit,
-on the x86 CI legs. Speed on x86 is unmeasured; expect about 2x over fp32
-there, not the 4-5x of `sdot`, since the lowering is three instructions.
+on the x86 CI legs. Speed on x86 is about 1.3x over fp32 at graph level and
+1.20x end to end on SROIE receipts (Windows x86-64, 40 receipts, 960 detect
+ceiling) - well short of the 4-5x `sdot` reaches, since the lowering is three
+instructions.
 
 ## Benchmarks
 
