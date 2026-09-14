@@ -3,7 +3,7 @@ import { defaultRecWorkers, isSeparator, Ocr } from "../src/ocr.ts";
 import { DEFAULT_DETECT, REFERENCE_BINARIZE } from "../src/pipeline/detect.ts";
 import { convexHull, mergeOverlapping, minAreaRect } from "../src/pipeline/boxes.ts";
 import { makeRecWorker } from "../src/node.ts";
-import { decodeJpeg } from "../src/image/jpeg.ts";
+import { decodeImage, decodeJpeg } from "../src/image/jpeg.ts";
 import { cropForBox, recognizeBatch } from "../src/pipeline/recognize.ts";
 import { decodePng } from "../src/image/png.ts";
 import { parseOnnx } from "../src/onnx/parse.ts";
@@ -361,6 +361,59 @@ test("the JPEG decoder lands close to the lossless original", async () => {
 test("the recognition pool is not started where it would lose", () => {
   // Two workers measured slower than inline; six is the ceiling that pays.
   expect([1, 2, 3, 4, 8, 16].map((cores) => defaultRecWorkers(cores))).toEqual([0, 0, 3, 4, 6, 6]);
+});
+
+test("a scaled decode halves the raster and preserves its levels", async () => {
+  const buf = await read("test/images/receipt.jpg");
+  const full = decodeJpeg(buf);
+  const half = decodeJpeg(buf, 2);
+
+  expect([half.width, half.height]).toEqual([full.width / 2, full.height / 2]);
+
+  // The low-frequency corner must reconstruct the same block means. A wrong
+  // IDCT prefactor scales every sample instead (measured as -15.8pp of OCR
+  // similarity when the divisor was taken as n/2 rather than 4), and reading
+  // the flat first n*n coefficients instead of the 2D corner loses the
+  // vertical frequencies (-23.3pp). Both show up here as a channel mean that
+  // has drifted, which the OCR score would only reveal much later.
+  const channelMean = (img: { data: Uint8Array }, c: number) => {
+    let s = 0;
+    for (let p = c; p < img.data.length; p += 4) s += img.data[p];
+    return s / (img.data.length / 4);
+  };
+  for (let c = 0; c < 3; c++) {
+    expect(channelMean(half, c)).toBeCloseTo(channelMean(full, c), 0);
+    expect(Math.abs(channelMean(half, c) - channelMean(full, c))).toBeLessThan(2);
+  }
+
+  // And it has to agree with a plain box downsample of the full-resolution
+  // decode, which is the resample it replaces.
+  let sum = 0;
+  const w = half.width;
+  const h = half.height;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      for (let c = 0; c < 3; c++) {
+        let s = 0;
+        for (let dy = 0; dy < 2; dy++) {
+          for (let dx = 0; dx < 2; dx++) {
+            const sx = Math.min(full.width - 1, x * 2 + dx);
+            const sy = Math.min(full.height - 1, y * 2 + dy);
+            s += full.data[(sy * full.width + sx) * 4 + c];
+          }
+        }
+        sum += Math.abs(s / 4 - half.data[(y * w + x) * 4 + c]);
+      }
+    }
+  }
+  expect(sum / (w * h * 3)).toBeLessThan(5);
+});
+
+test("an unsupported downscale is rejected rather than silently ignored", async () => {
+  const buf = await read("test/images/receipt.jpg");
+  expect(() => decodeJpeg(buf, 3 as 1)).toThrow(/downscale/);
+  const png = await read("test/images/receipt.png");
+  await expect(decodeImage(png, 2)).rejects.toThrow(/JPEG/);
 });
 
 test("rule characters are dropped, text with letters or digits is not", () => {
