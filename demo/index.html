@@ -22,19 +22,33 @@
   label.toggle { display: inline-flex; gap: 7px; align-items: center; font-size: 13px; color: var(--muted); cursor: pointer; }
   label.toggle input { accent-color: var(--accent); }
   #status { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
-  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; }
+  .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 20px; align-items: start; }
   @media (max-width: 760px) { .cols { grid-template-columns: minmax(0, 1fr); } }
-  canvas { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 8px; display: block; }
+  /* The image scales to fit a fixed frame; it never sets the page height. */
+  .frame { height: 480px; display: flex; align-items: center; justify-content: center;
+           border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+           background: color-mix(in srgb, var(--fg) 3%, transparent); }
+  @media (max-width: 760px) { .frame { height: 320px; } }
+  canvas { max-width: 100%; max-height: 100%; width: auto; height: auto; display: block; }
   pre { margin: 0; padding: 13px; background: color-mix(in srgb, var(--fg) 4%, transparent);
         border: 1px solid var(--line); border-radius: 8px; font: 12.5px/1.6 ui-monospace, monospace;
-        white-space: pre-wrap; overflow-wrap: anywhere; min-height: 120px; }
-  .stats { margin-top: 12px; font-size: 12.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .stats b { color: var(--fg); font-weight: 600; }
+        white-space: pre-wrap; overflow-wrap: anywhere; min-height: 120px; max-height: 480px; overflow-y: auto; }
+  /* The numbers are the point of the page. */
+  .stats { display: flex; gap: 28px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 18px;
+           padding: 16px 20px; border: 1px solid var(--line); border-radius: 10px;
+           font-variant-numeric: tabular-nums; }
+  .stat { display: flex; flex-direction: column; gap: 2px; }
+  .stat .v { font-size: 26px; font-weight: 650; line-height: 1.1; letter-spacing: -0.02em; }
+  .stat .v small { font-size: 14px; font-weight: 500; color: var(--muted); margin-left: 3px; }
+  .stat .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat.hero .v { font-size: 44px; color: var(--accent); }
+  .cfg { flex-basis: 100%; font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+  .cfg b { color: var(--fg); font-weight: 600; }
 </style>
 
 <main>
   <h1>tiny6-paddleocr</h1>
-  <p class="sub">PP-OCRv6 tiny in the browser. No runtime dependencies: hand-written ONNX interpreter, WASM SIMD kernels, 25 KB gzipped.</p>
+  <p class="sub">PP-OCRv6 tiny in the browser. No runtime dependencies: a hand-written ONNX interpreter and WASM SIMD kernels, int8 where the engine allows.</p>
 
   <div class="bar">
     <button id="load">Load models</button>
@@ -44,10 +58,19 @@
     <span id="status">idle</span>
   </div>
 
+  <section class="stats" id="stats" hidden>
+    <div class="stat hero"><span class="v" id="s-total">-</span><span class="k">total inference</span></div>
+    <div class="stat"><span class="v" id="s-det">-</span><span class="k">detect</span></div>
+    <div class="stat"><span class="v" id="s-rec">-</span><span class="k">recognize</span></div>
+    <div class="stat"><span class="v" id="s-boxes">-</span><span class="k">boxes</span></div>
+    <div class="stat"><span class="v" id="s-lines">-</span><span class="k">lines</span></div>
+    <div class="stat"><span class="v" id="s-size">-</span><span class="k">image</span></div>
+    <div class="cfg" id="cfg"></div>
+  </section>
+
   <div class="cols">
-    <div><canvas id="view"></canvas></div>
-    <div><pre id="out">Load the models, then pick an image.</pre>
-      <div class="stats" id="stats"></div></div>
+    <div class="frame"><canvas id="view"></canvas></div>
+    <pre id="out">Load the models, then pick an image.</pre>
   </div>
 </main>
 
@@ -75,10 +98,11 @@
       threadLabel = `${threads} thread${threads > 1 ? "s" : ""}, ` +
         `${rec > 0 ? rec + " rec worker" + (rec > 1 ? "s" : "") : "inline rec"}, ` +
         `${ocr.int8 ? "int8" : "fp32"}`;
-      // The run status overwrites this line, so keep the thread count in the
-      // stats row where it survives.
-      $("stats").innerHTML = `<b>${threadLabel}</b>` +
+      // The run status overwrites this line, so keep the configuration in
+      // the stats block where it survives.
+      $("cfg").innerHTML = `<b>${threadLabel}</b>` +
         (canUseThreads() ? "" : " &middot; no SharedArrayBuffer, serve with COOP/COEP for threads");
+      $("stats").hidden = false;
       status(`ready in ${Math.round(performance.now() - t0)} ms`);
       $("sample").disabled = false;
     } catch (e) {
@@ -111,9 +135,13 @@
 
     draw(img, boxes);
     $("out").textContent = lines.map((l) => l.text).join("\n") || "(no text found)";
-    $("stats").innerHTML =
-      `<b>${threadLabel}</b> &middot; detect <b>${Math.round(tDet - t0)} ms</b> &middot; ${boxes.length} boxes &middot; ` +
-      `recognize <b>${Math.round(tAll - tDet)} ms</b> &middot; ${lines.length} lines`;
+    const ms = (v) => `${Math.round(v)}<small>ms</small>`;
+    $("s-total").innerHTML = ms(tAll - t0);
+    $("s-det").innerHTML = ms(tDet - t0);
+    $("s-rec").innerHTML = ms(tAll - tDet);
+    $("s-boxes").textContent = boxes.length;
+    $("s-lines").textContent = lines.length;
+    $("s-size").innerHTML = `${img.width}<small>x</small>${img.height}`;
     status("done");
   }
 
