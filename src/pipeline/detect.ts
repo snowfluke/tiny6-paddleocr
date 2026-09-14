@@ -41,7 +41,7 @@ export type DetectOptions = {
    * fires on logos, rules and barcodes and the recogniser has to filter them
    * out. Raising it drops those regions before recognition instead.
    */
-  binarizeThreshold: number;
+  binarizeThreshold?: number;
   /**
    * Fit each region with a minimum-area rectangle instead of an upright box,
    * and straighten the crop before recognition. Off by default: it changes
@@ -108,7 +108,8 @@ export function detect(session: Session, img: RGBA, opts: DetectOptions = DEFAUL
   // Raise binarizeThreshold to drop the low-probability regions that cut lets
   // through; DEFAULT_DETECT keeps the reference's value.
   const mask = new Uint8Array(width * height);
-  for (let i = 0; i < mask.length; i++) mask[i] = prob[i] >= opts.binarizeThreshold ? 1 : 0;
+  const cut = opts.binarizeThreshold ?? REFERENCE_BINARIZE;
+  for (let i = 0; i < mask.length; i++) mask[i] = prob[i] >= cut ? 1 : 0;
 
   const boxes: Box[] = [];
   for (const r of connectedRegions(mask, width, height, opts.rotated)) {

@@ -648,11 +648,14 @@ function toRgba(components: Component[], width: number, height: number, hMax: nu
 }
 
 /** Dispatches on the file's magic bytes. */
+/**
+ * `downscale` is honoured for JPEG, where it comes free from the DCT; a PNG
+ * has no cheap low-frequency path, so it decodes at full size and the caller
+ * gets the larger image. A caller that must have the smaller raster can
+ * resample the result.
+ */
 export async function decodeImage(buf: Uint8Array, downscale: 1 | 2 | 4 = 1): Promise<RGBA> {
   if (buf[0] === 0xff && buf[1] === 0xd8) return decodeJpeg(buf, downscale);
-  // PNG has no cheap low-frequency path; a scaled PNG decode would have to
-  // resample after the fact, which is the cost this option exists to avoid.
-  if (downscale !== 1) throw new Error("downscale is only supported for JPEG");
   const { decodePng } = await import("./png.ts");
   return decodePng(buf);
 }

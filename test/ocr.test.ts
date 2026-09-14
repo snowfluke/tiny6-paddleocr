@@ -235,8 +235,18 @@ test("raising binarizeThreshold drops regions and never adds them", async () => 
 
   expect(raised).toBeLessThanOrEqual(reference);
   expect(DEFAULT_DETECT.binarizeThreshold).toBe(REFERENCE_BINARIZE);
+  // Options built without the field get the reference cut, not NaN.
+  const { binarizeThreshold: _dropped, ...without } = at960;
+  expect(ocr.detect(img, without).boxes.length).toBe(reference);
   ocr.destroy();
 }, 180_000);
+
+test("a PNG ignores the decode scale instead of throwing", async () => {
+  const buf = await read("test/images/receipt.png");
+  const full = await decodeImage(buf);
+  const asked = await decodeImage(buf, 2);
+  expect([asked.width, asked.height]).toEqual([full.width, full.height]);
+});
 
 test("the confidence filter drops barcode noise and keeps the text", async () => {
   const ocr = await makeOcr();
