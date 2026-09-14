@@ -63,9 +63,17 @@ import { createOcr, decodeImage } from "./tiny6.js";
 const ocr = await createOcr({
   detUrl: "models/det.onnx", recUrl: "models/rec.onnx", dictUrl: "models/dict.txt",
   detCalibUrl: "models/det.calib.json", recCalibUrl: "models/rec.calib.json",
+  // recWorkers: 6,   // default: defaultRecWorkers(); 1 keeps recognition inline
 });
-const lines = ocr.recognize(await decodeImage(file));
+const lines = await ocr.recognizeAsync(await decodeImage(file));
 ```
+
+Recognition runs on a pool of workers, each holding its own copy of the rec
+weights. Use the async entry point: `recognize` and `recognizeBoxes` are
+synchronous by design and run the crops inline, one after another. The pool
+pays from about four crops up; below that `recognizeBoxesAsync` falls back to
+the inline path on its own. A worker uses its own non-shared memory, so the
+pool works on any page — only the detection threads need the headers below.
 
 Chrome 114+, Firefox 145+, Node 21+ and Bun get the relaxed-SIMD kernels;
 Safari, which keeps relaxed SIMD behind a flag, gets a basic build of the

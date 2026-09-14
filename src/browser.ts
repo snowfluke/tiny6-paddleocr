@@ -1,7 +1,7 @@
 // Browser entry. The kernels are inlined as base64 at build time, so the page
 // loads one script plus the two model files and nothing else.
 
-import { Ocr, type OcrLine } from "./ocr.ts";
+import { defaultRecWorkers, Ocr, type OcrLine } from "./ocr.ts";
 import type { RGBA } from "./image/png.ts";
 import { decodePng } from "./image/png.ts";
 
@@ -62,6 +62,18 @@ export async function decodeImage(blob: Blob): Promise<RGBA> {
 import { measureCores, reportsFakeCores } from "./cores.ts";
 import { makeMemoryShared } from "./wasm/share-memory.ts";
 
+/**
+ * Spawns the recognition worker. Unlike Node, which resolves a module URL, the
+ * browser gets a second bundle sitting next to this one (tools/build-web.ts),
+ * so a plain relative URL is enough.
+ */
+export function makeRecWorker(): Worker {
+  return new Worker(new URL("./rec-worker.js", import.meta.url), {
+    type: "module",
+    name: "tiny6-rec",
+  });
+}
+
 export type WebAssets = {
   detUrl: string;
   recUrl: string;
@@ -71,6 +83,12 @@ export type WebAssets = {
   recCalibUrl?: string;
   /** Defaults to half the cores when the page is cross-origin isolated. */
   threads?: number;
+  /**
+   * Recognition workers, each holding its own copy of the rec weights. Whole
+   * crops are handed out, so this is what makes a page with many boxes scale.
+   * Defaults to defaultRecWorkers(); 0 or 1 stays on the calling thread.
+   */
+  recWorkers?: number;
 };
 
 export async function createOcr(
@@ -99,6 +117,9 @@ export async function createOcr(
   // Brave reports a random core count per site; measure instead (src/cores.ts).
   const threads = assets.threads ?? (threaded && reportsFakeCores() ? await measureCores() : undefined);
   const wasm = base64ToBytes(relaxed ? __KERNELS_B64__ : __KERNELS_BASIC_B64__);
+  // A rec worker keeps its own non-shared memory, so it does not need
+  // cross-origin isolation; only the detection arena does.
+  const workers = typeof Worker === "undefined" ? 0 : (assets.recWorkers ?? defaultRecWorkers());
   return Ocr.create({
     det,
     rec,
@@ -108,6 +129,8 @@ export async function createOcr(
     threads: threaded ? threads : 1,
     detCalib,
     recCalib,
+    recWorkers: workers,
+    makeRecWorker: workers > 1 ? makeRecWorker : undefined,
   });
 }
 
