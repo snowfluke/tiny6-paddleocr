@@ -66,9 +66,11 @@ export function isSeparator(text: string): boolean {
  * barrier, so an efficiency core can help here where it cannot in the
  * detection pool. Each worker holds its own copy of the weights, 4.3 MB.
  */
-export function defaultRecWorkers(): number {
-  const n = typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 4) : 4;
-  return Math.max(1, Math.min(6, n));
+export function defaultRecWorkers(cores?: number): number {
+  const n = cores ?? (typeof navigator !== "undefined" ? (navigator.hardwareConcurrency ?? 4) : 4);
+  // Two workers measured slower than the calling thread (0.93x in Chrome):
+  // not enough parallelism to cover the crops, still a message per crop.
+  return n < 3 ? 0 : Math.min(6, n);
 }
 
 export class Ocr {

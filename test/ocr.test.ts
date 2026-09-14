@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { isSeparator, Ocr } from "../src/ocr.ts";
+import { defaultRecWorkers, isSeparator, Ocr } from "../src/ocr.ts";
 import { DEFAULT_DETECT } from "../src/pipeline/detect.ts";
 import { convexHull, mergeOverlapping, minAreaRect } from "../src/pipeline/boxes.ts";
 import { makeRecWorker } from "../src/node.ts";
@@ -335,6 +335,11 @@ test("the JPEG decoder lands close to the lossless original", async () => {
   // The PNG was produced from this JPEG, so the gap is chroma upsampling and
   // IDCT rounding, not decode error.
   expect(sum / jpg.data.length).toBeLessThan(2);
+});
+
+test("the recognition pool is not started where it would lose", () => {
+  // Two workers measured slower than inline; six is the ceiling that pays.
+  expect([1, 2, 3, 4, 8, 16].map((cores) => defaultRecWorkers(cores))).toEqual([0, 0, 3, 4, 6, 6]);
 });
 
 test("rule characters are dropped, text with letters or digits is not", () => {

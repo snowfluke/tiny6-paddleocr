@@ -115,11 +115,14 @@ export async function createOcr(
   onProgress?.("kernels");
   const threaded = canUseThreads();
   // Brave reports a random core count per site; measure instead (src/cores.ts).
-  const threads = assets.threads ?? (threaded && reportsFakeCores() ? await measureCores() : undefined);
+  // The count feeds both pools, so it is measured even on a page without
+  // shared memory, where only the recognition pool can use it.
+  const cores = reportsFakeCores() ? await measureCores() : undefined;
+  const threads = assets.threads ?? (threaded ? cores : undefined);
   const wasm = base64ToBytes(relaxed ? __KERNELS_B64__ : __KERNELS_BASIC_B64__);
   // A rec worker keeps its own non-shared memory, so it does not need
   // cross-origin isolation; only the detection arena does.
-  const workers = typeof Worker === "undefined" ? 0 : (assets.recWorkers ?? defaultRecWorkers());
+  const workers = typeof Worker === "undefined" ? 0 : (assets.recWorkers ?? defaultRecWorkers(cores));
   return Ocr.create({
     det,
     rec,
