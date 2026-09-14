@@ -42,6 +42,7 @@
   .stat .v small { font-size: 14px; font-weight: 500; color: var(--muted); margin-left: 3px; }
   .stat .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
   .stat.hero .v { font-size: 44px; color: var(--accent); }
+  .stat .h { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .cfg { flex-basis: 100%; font-size: 12.5px; color: var(--muted); margin-top: 2px; }
   .cfg b { color: var(--fg); font-weight: 600; }
 </style>
@@ -59,7 +60,8 @@
   </div>
 
   <section class="stats" id="stats" hidden>
-    <div class="stat hero"><span class="v" id="s-total">-</span><span class="k">total inference</span></div>
+    <div class="stat hero"><span class="v" id="s-total">-</span><span class="k" id="s-total-k">total inference</span>
+      <span class="h" id="s-hist"></span></div>
     <div class="stat"><span class="v" id="s-det">-</span><span class="k">detect</span></div>
     <div class="stat"><span class="v" id="s-rec">-</span><span class="k">recognize</span></div>
     <div class="stat"><span class="v" id="s-boxes">-</span><span class="k">boxes</span></div>
@@ -81,6 +83,9 @@
   const status = (s) => ($("status").textContent = s);
   let ocr = null;
   let threadLabel = "";
+  // Totals of every run since load. The first run pays for JIT warm-up and
+  // memory growth; the numbers that mean anything are the warm ones.
+  const runs = [];
 
   $("load").onclick = async () => {
     $("load").disabled = true;
@@ -136,7 +141,12 @@
     draw(img, boxes);
     $("out").textContent = lines.map((l) => l.text).join("\n") || "(no text found)";
     const ms = (v) => `${Math.round(v)}<small>ms</small>`;
+    runs.push(tAll - t0);
     $("s-total").innerHTML = ms(tAll - t0);
+    $("s-total-k").textContent = runs.length === 1 ? "total inference, first run (cold)" : `total inference, run ${runs.length} (warm)`;
+    $("s-hist").textContent = runs.length === 1
+      ? "run again for a warm number"
+      : `first ${Math.round(runs[0])} ms, best ${Math.round(Math.min(...runs))} ms, ${runs.length} runs`;
     $("s-det").innerHTML = ms(tDet - t0);
     $("s-rec").innerHTML = ms(tAll - tDet);
     $("s-boxes").textContent = boxes.length;
