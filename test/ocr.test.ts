@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { defaultRecWorkers, isSeparator, Ocr } from "../src/ocr.ts";
-import { DEFAULT_DETECT } from "../src/pipeline/detect.ts";
+import { DEFAULT_DETECT, REFERENCE_BINARIZE } from "../src/pipeline/detect.ts";
 import { convexHull, mergeOverlapping, minAreaRect } from "../src/pipeline/boxes.ts";
 import { makeRecWorker } from "../src/node.ts";
 import { decodeJpeg } from "../src/image/jpeg.ts";
@@ -214,6 +214,27 @@ test("receipt matches the ORT reference on most lines", async () => {
   expect(got.length).toBe(want.length);
   const same = got.filter((l, i) => l === want[i]).length;
   expect(same).toBeGreaterThanOrEqual(13);
+  ocr.destroy();
+}, 180_000);
+
+/**
+ * The reference transcript above is what pins the default: the reference path
+ * rounds the probability to a byte, so its effective cut is one 8-bit step.
+ * Raising the cut drops the low-probability regions that step lets through -
+ * on SROIE that is +1.7 points of character similarity for 5% more time, with
+ * the median box count unchanged. It must never invent regions, and the
+ * default must stay the reference or every compared transcript shifts.
+ */
+test("raising binarizeThreshold drops regions and never adds them", async () => {
+  const ocr = await makeOcr(4);
+  const img = await decodePng(await read("test/images/receipt.png"));
+  const at960 = { ...DEFAULT_DETECT, maxSideLength: 960 };
+
+  const reference = ocr.detect(img, at960).boxes.length;
+  const raised = ocr.detect(img, { ...at960, binarizeThreshold: 0.5 }).boxes.length;
+
+  expect(raised).toBeLessThanOrEqual(reference);
+  expect(DEFAULT_DETECT.binarizeThreshold).toBe(REFERENCE_BINARIZE);
   ocr.destroy();
 }, 180_000);
 
