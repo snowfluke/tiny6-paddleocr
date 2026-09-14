@@ -102,25 +102,31 @@ export class Ocr {
 
   static async create(a: Assets): Promise<Ocr> {
     const threads = a.threads ?? (a.wasmShared ? defaultThreads() : 1);
-    const arena = threads > 1 && a.wasmShared
-      ? await loadKernelsThreaded(a.wasmShared, threads)
+    const threaded = threads > 1 && !!a.wasmShared;
+    // The pool starts after the Sessions, not before them: the constructor
+    // uploads every weight into the arena, each upload can grow the shared
+    // memory, and a pool that is already spinning makes every one of those
+    // grows several times more expensive. Measured on this machine, 8 threads
+    // against 1, the two Sessions cost 155.9 ms with the pool first and
+    // 50.2 ms with it deferred - see backend.loadKernelsThreaded.
+    const arena = threaded
+      ? await loadKernelsThreaded(a.wasmShared!, threads, 64, false)
       : await loadKernels(a.wasm);
+
+    // An engine whose dot product lowering the probe does not recognise
+    // stays on fp32 rather than being silently wrong.
+    const int8 = (json?: string) => (json && arena.dotMode !== "none" ? { int8: JSON.parse(json) } : {});
+    const det = new Session(parseOnnx(a.det), arena, int8(a.detCalib));
+    const rec = new Session(parseOnnx(a.rec), arena, int8(a.recCalib));
+
+    if (threaded) await arena.startPool(a.wasmShared!, threads);
 
     const recCount = a.recWorkers ?? defaultRecWorkers();
     const recPool = a.makeRecWorker && recCount > 1
       ? await RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict, calib: arena.dotMode !== "none" ? a.recCalib : undefined }, recCount)
       : null;
 
-    // An engine whose dot product lowering the probe does not recognise
-    // stays on fp32 rather than being silently wrong.
-    const int8 = (json?: string) => (json && arena.dotMode !== "none" ? { int8: JSON.parse(json) } : {});
-    return new Ocr(
-      new Session(parseOnnx(a.det), arena, int8(a.detCalib)),
-      new Session(parseOnnx(a.rec), arena, int8(a.recCalib)),
-      parseDictionary(a.dict),
-      arena,
-      recPool,
-    );
+    return new Ocr(det, rec, parseDictionary(a.dict), arena, recPool);
   }
 
   /** Stops both worker pools. The instance is unusable afterwards. */

@@ -500,10 +500,17 @@ export async function loadKernelsThreaded(
   bytes: Uint8Array,
   threads = defaultThreads(),
   initialPages = 64,
+  startPool = true,
 ): Promise<Arena> {
   const memory = new WebAssembly.Memory({ initial: initialPages, maximum: 32768, shared: true });
   const result = await WebAssembly.instantiate(bytes as BufferSource, { env: { memory } });
   const arena = new Arena(instanceOf(result).exports, memory);
-  await arena.startPool(bytes, threads);
+  // Pass false when the caller still has weights to upload, then call
+  // arena.startPool() once they are in. A pool that is already spinning makes
+  // every memory.grow the uploads trigger far more expensive - the same 4.27 MB
+  // of constants uploads in 77.2 ms with eight workers against 10.9 ms with one,
+  // and deferring the pool entirely took Ocr.create's two Sessions from 155.9 ms
+  // to 50.2 ms. Callers with nothing left to upload keep the default.
+  if (startPool) await arena.startPool(bytes, threads);
   return arena;
 }
