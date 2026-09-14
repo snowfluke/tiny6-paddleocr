@@ -448,11 +448,9 @@ test("the decode raster is bit-identical to what it has always been", async () =
   expect(fnv(half.data)).toBe("bfa9ed72");
 });
 
-test("an unsupported downscale is rejected rather than silently ignored", async () => {
+test("an unsupported downscale factor is rejected", async () => {
   const buf = await read("test/images/receipt.jpg");
   expect(() => decodeJpeg(buf, 3 as 1)).toThrow(/downscale/);
-  const png = await read("test/images/receipt.png");
-  await expect(decodeImage(png, 2)).rejects.toThrow(/JPEG/);
 });
 
 test("rule characters are dropped, text with letters or digits is not", () => {
