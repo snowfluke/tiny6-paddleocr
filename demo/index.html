@@ -11,7 +11,9 @@
   body { margin: 0; padding-block: 28px; padding-inline: 16px; background: var(--bg); color: var(--fg);
          font: 15px/1.55 ui-sans-serif, system-ui, sans-serif; }
   main { max-width: 1040px; margin: 0 auto; }
-  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -0.01em; display: flex; align-items: baseline; gap: 12px; }
+  h1 a { font-size: 13px; font-weight: 500; color: var(--muted); text-decoration: none; }
+  h1 a:hover { color: var(--accent); }
   .sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
   .bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 18px; }
   button, label.file { border: 1px solid var(--line); background: transparent; color: var(--fg);
@@ -48,7 +50,7 @@
 </style>
 
 <main>
-  <h1>tiny6-paddleocr</h1>
+  <h1>tiny6-paddleocr <a href="https://github.com/snowfluke/tiny6-paddleocr">github.com/snowfluke/tiny6-paddleocr</a></h1>
   <p class="sub">PP-OCRv6 tiny in the browser. No runtime dependencies: a hand-written ONNX interpreter and WASM SIMD kernels, int8 where the engine allows.</p>
 
   <div class="bar">
