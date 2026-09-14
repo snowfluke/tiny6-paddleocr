@@ -113,6 +113,28 @@ export class Ocr {
       ? await loadKernelsThreaded(a.wasmShared!, threads, 64, false)
       : await loadKernels(a.wasm);
 
+    // The recognition pool is started here, before the Sessions, so its work
+    // overlaps them instead of following them. It shares nothing with the
+    // constructor but arena.dotMode, and spawning the workers, cloning 4.4 MB
+    // of weights into each and having each one parse the model is the single
+    // largest cost in a browser start: measured in Chrome on this page, six
+    // workers take 8 ms to spawn, 27 ms of main-thread clone and 38 ms to
+    // initialise, against 55 ms for both Sessions. In series that is 155 ms
+    // end to end; overlapped it is the longer of the two plus the clone.
+    //
+    // The synchronous part of RecPool.create - the spawn and every postMessage
+    // - still runs before the constructor does, since JS is single threaded up
+    // to its first await. That is the 35 ms that cannot be hidden, and it is
+    // cheaper than the 38 ms of initialisation it buys.
+    const recCount = a.recWorkers ?? defaultRecWorkers();
+    const recPoolPromise = a.makeRecWorker && recCount > 1
+      ? RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict, calib: arena.dotMode !== "none" ? a.recCalib : undefined }, recCount)
+      : null;
+    // The await below is separated from this by another await, so a rejection
+    // arriving in between would be reported as unhandled before anyone is
+    // listening. This keeps the original promise awaitable and still rejects.
+    recPoolPromise?.catch(() => {});
+
     // An engine whose dot product lowering the probe does not recognise
     // stays on fp32 rather than being silently wrong.
     const int8 = (json?: string) => (json && arena.dotMode !== "none" ? { int8: JSON.parse(json) } : {});
@@ -120,11 +142,7 @@ export class Ocr {
     const rec = new Session(parseOnnx(a.rec), arena, int8(a.recCalib));
 
     if (threaded) await arena.startPool(a.wasmShared!, threads);
-
-    const recCount = a.recWorkers ?? defaultRecWorkers();
-    const recPool = a.makeRecWorker && recCount > 1
-      ? await RecPool.create(a.makeRecWorker, { rec: a.rec, wasm: a.wasm, dict: a.dict, calib: arena.dotMode !== "none" ? a.recCalib : undefined }, recCount)
-      : null;
+    const recPool = recPoolPromise ? await recPoolPromise : null;
 
     return new Ocr(det, rec, parseDictionary(a.dict), arena, recPool);
   }
